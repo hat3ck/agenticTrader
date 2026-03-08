@@ -216,7 +216,7 @@ async def run_suggest(
     result = await trader_agent.run(
         user_prompt,
         deps=deps,
-        system_prompt=system_prompt,
+        instructions=system_prompt,
     )
     return result.output
 

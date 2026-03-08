@@ -20,20 +20,21 @@ def _generate_mock_ohlcv(ticker: str, days: int = 252) -> pd.DataFrame:
     """Generate a realistic-looking OHLCV DataFrame for testing."""
     np.random.seed(hash(ticker) % 2**31)
     dates = pd.bdate_range(end=dt.date.today(), periods=days)
+    n = len(dates)  # actual count — may differ from `days` on weekends/holidays
     base_price = {"AAPL": 185, "MSFT": 420, "NVDA": 890, "GOOGL": 175, "AMZN": 195}.get(
         ticker.upper(), random.randint(50, 400)
     )
     # Geometric Brownian Motion
-    returns = np.random.normal(0.0005, 0.02, days)
+    returns = np.random.normal(0.0005, 0.02, n)
     prices = base_price * np.cumprod(1 + returns)
 
     df = pd.DataFrame(
         {
-            "Open": prices * (1 + np.random.uniform(-0.005, 0.005, days)),
-            "High": prices * (1 + np.random.uniform(0.001, 0.025, days)),
-            "Low": prices * (1 - np.random.uniform(0.001, 0.025, days)),
+            "Open": prices * (1 + np.random.uniform(-0.005, 0.005, n)),
+            "High": prices * (1 + np.random.uniform(0.001, 0.025, n)),
+            "Low": prices * (1 - np.random.uniform(0.001, 0.025, n)),
             "Close": prices,
-            "Volume": np.random.randint(5_000_000, 80_000_000, days),
+            "Volume": np.random.randint(5_000_000, 80_000_000, n),
         },
         index=dates,
     )
