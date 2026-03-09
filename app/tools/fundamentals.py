@@ -1,16 +1,322 @@
 """Fundamental Analysis Tool — Financial metrics calculator.
 
-Currently returns MOCK data.  Will be replaced with yfinance later.
+Data sources:
+  • Primary  — yfinance (balance sheet, income statement, cash flow, .info)
+  • Fallback — SEC EDGAR XBRL company-facts API (free, official filings)
+
 Metrics: Market Cap, P/E, P/B, PEG, D/E, FCF, ROE, Dividend Yield,
-Revenue Growth Rate.
+Revenue Growth Rate, EPS, Profit Margin, Payout Ratio.
 """
 
 from __future__ import annotations
 
-import random
+import asyncio
+import logging
+from typing import Any
 
+import httpx
+import yfinance as yf
+
+from app.config import settings
 from app.data.cache import fundamental_cache, async_get_or_set
 
+logger = logging.getLogger(__name__)
+
+# ── SEC EDGAR helpers ────────────────────────────────────────────────────────
+
+_CIK_LOOKUP_URL = "https://www.sec.gov/files/company_tickers.json"
+_COMPANY_FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+
+# In-memory ticker→CIK map (populated lazily)
+_ticker_to_cik: dict[str, str] = {}
+
+
+def _safe(val: Any, fallback: Any = None) -> Any:
+    """Return *val* unless it is None / NaN, in which case return *fallback*."""
+    if val is None:
+        return fallback
+    try:
+        if val != val:  # noqa: PLR0124  (NaN ≠ itself)
+            return fallback
+    except (TypeError, ValueError):
+        pass
+    return val
+
+
+def _safe_round(val: Any, decimals: int = 2, fallback: Any = None) -> Any:
+    """Round *val* if numeric, else return *fallback*."""
+    val = _safe(val, fallback)
+    if val is None:
+        return fallback
+    try:
+        return round(float(val), decimals)
+    except (TypeError, ValueError):
+        return fallback
+
+
+async def _ensure_cik_map() -> None:
+    """Populate _ticker_to_cik from SEC EDGAR company tickers JSON (once)."""
+    global _ticker_to_cik  # noqa: PLW0603
+    if _ticker_to_cik:
+        return
+    try:
+        headers = {"User-Agent": settings.sec_edgar_user_agent}
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(_CIK_LOOKUP_URL, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+        _ticker_to_cik = {
+            entry["ticker"].upper(): str(entry["cik_str"]).zfill(10)
+            for entry in data.values()
+        }
+        logger.debug("Loaded %d ticker→CIK mappings from SEC", len(_ticker_to_cik))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to load SEC CIK map: %s", exc)
+
+
+async def _fetch_edgar_facts(ticker: str) -> dict | None:
+    """Fetch XBRL company facts from SEC EDGAR.  Returns None on failure."""
+    await _ensure_cik_map()
+    cik = _ticker_to_cik.get(ticker.upper())
+    if not cik:
+        logger.debug("No CIK found for %s", ticker)
+        return None
+    url = _COMPANY_FACTS_URL.format(cik=cik)
+    try:
+        headers = {"User-Agent": settings.sec_edgar_user_agent}
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(url, headers=headers)
+            resp.raise_for_status()
+            return resp.json()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("SEC EDGAR fetch failed for %s (CIK %s): %s", ticker, cik, exc)
+        return None
+
+
+def _latest_fact(facts: dict, taxonomy: str, concept: str) -> float | None:
+    """Extract the latest filed value for a given XBRL concept."""
+    try:
+        units = facts["facts"][taxonomy][concept]["units"]
+        # Prefer USD, fall back to first available unit
+        values = units.get("USD") or units.get("USD/shares") or next(iter(units.values()), None)
+        if not values:
+            return None
+        # Sort by end date descending; take most recent 10-K/10-Q
+        annual = [v for v in values if v.get("form") in ("10-K", "10-Q")]
+        if not annual:
+            annual = values
+        annual.sort(key=lambda v: v.get("end", ""), reverse=True)
+        return float(annual[0]["val"])
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+
+
+def _two_latest_annual_facts(facts: dict, taxonomy: str, concept: str) -> tuple[float | None, float | None]:
+    """Return (latest, previous) annual filed values for YoY growth calculation."""
+    try:
+        units = facts["facts"][taxonomy][concept]["units"]
+        values = units.get("USD") or next(iter(units.values()), None)
+        if not values:
+            return None, None
+        annual = [v for v in values if v.get("form") == "10-K"]
+        if len(annual) < 2:
+            return None, None
+        annual.sort(key=lambda v: v.get("end", ""), reverse=True)
+        return float(annual[0]["val"]), float(annual[1]["val"])
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None, None
+
+
+# ── yfinance helpers ─────────────────────────────────────────────────────────
+
+def _yf_ticker(ticker: str) -> yf.Ticker:
+    return yf.Ticker(ticker.upper())
+
+
+def _extract_yf_fundamentals(t: yf.Ticker) -> dict[str, Any]:
+    """Pull all available fundamental data from a yfinance Ticker (sync).
+
+    Runs in a thread via asyncio.to_thread.
+    """
+    info: dict = t.info or {}
+
+    # ── Direct from .info ────────────────────────────────────────────────
+    market_cap = _safe(info.get("marketCap"))
+    pe = _safe(info.get("trailingPE") or info.get("forwardPE"))
+    pb = _safe(info.get("priceToBook"))
+    peg = _safe(info.get("pegRatio"))
+    de = _safe(info.get("debtToEquity"))
+    # yfinance reports debtToEquity as a percentage (e.g. 180 = 1.8x)
+    if de is not None:
+        de = round(de / 100, 2)
+    fcf = _safe(info.get("freeCashflow"))
+    roe = _safe(info.get("returnOnEquity"))
+    # yfinance ROE is a decimal (0.25 = 25%)
+    if roe is not None:
+        roe = round(roe * 100, 2)
+    div_yield = _safe(info.get("dividendYield"))
+    if div_yield is not None:
+        div_yield = round(div_yield * 100, 2)
+    eps = _safe(info.get("trailingEps") or info.get("forwardEps"))
+    margin = _safe(info.get("profitMargins"))
+    if margin is not None:
+        margin = round(margin * 100, 2)
+    payout = _safe(info.get("payoutRatio"))
+    if payout is not None:
+        payout = round(payout * 100, 2)
+
+    # ── Revenue growth from financials ───────────────────────────────────
+    rev_growth = _safe(info.get("revenueGrowth"))
+    if rev_growth is not None:
+        rev_growth = round(rev_growth * 100, 2)
+    else:
+        # Calculate from income statement if .info doesn't have it
+        try:
+            inc = t.financials  # columns = fiscal year ends
+            if inc is not None and "Total Revenue" in inc.index and inc.shape[1] >= 2:
+                rev_latest = float(inc.loc["Total Revenue"].iloc[0])
+                rev_prev = float(inc.loc["Total Revenue"].iloc[1])
+                if rev_prev and rev_prev != 0:
+                    rev_growth = round((rev_latest - rev_prev) / abs(rev_prev) * 100, 2)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ── FCF fallback: operating cash flow − capex from cashflow stmt ─────
+    if fcf is None:
+        try:
+            cf = t.cashflow
+            if cf is not None:
+                ocf = cf.loc["Operating Cash Flow"].iloc[0] if "Operating Cash Flow" in cf.index else None
+                capex = cf.loc["Capital Expenditure"].iloc[0] if "Capital Expenditure" in cf.index else None
+                if ocf is not None and capex is not None:
+                    fcf = float(ocf) + float(capex)  # capex is typically negative
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ── D/E fallback from balance sheet ──────────────────────────────────
+    if de is None:
+        try:
+            bs = t.balance_sheet
+            if bs is not None:
+                total_debt = None
+                for label in ("Total Debt", "Long Term Debt"):
+                    if label in bs.index:
+                        total_debt = float(bs.loc[label].iloc[0])
+                        break
+                equity = None
+                for label in ("Stockholders Equity", "Total Stockholder Equity", "Common Stock Equity"):
+                    if label in bs.index:
+                        equity = float(bs.loc[label].iloc[0])
+                        break
+                if total_debt is not None and equity and equity != 0:
+                    de = round(total_debt / equity, 2)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ── ROE fallback: net income / equity ────────────────────────────────
+    if roe is None:
+        try:
+            inc = t.financials
+            bs = t.balance_sheet
+            if inc is not None and bs is not None:
+                ni = None
+                for label in ("Net Income", "Net Income Common Stockholders"):
+                    if label in inc.index:
+                        ni = float(inc.loc[label].iloc[0])
+                        break
+                equity = None
+                for label in ("Stockholders Equity", "Total Stockholder Equity", "Common Stock Equity"):
+                    if label in bs.index:
+                        equity = float(bs.loc[label].iloc[0])
+                        break
+                if ni is not None and equity and equity != 0:
+                    roe = round(ni / equity * 100, 2)
+        except Exception:  # noqa: BLE001
+            pass
+
+    return {
+        "market_cap": market_cap,
+        "pe": pe,
+        "pb": pb,
+        "peg": peg,
+        "de": de,
+        "fcf": fcf,
+        "roe": roe,
+        "div_yield": div_yield,
+        "rev_growth": rev_growth,
+        "eps": eps,
+        "margin": margin,
+        "payout": payout,
+    }
+
+
+# ── SEC EDGAR enrichment ────────────────────────────────────────────────────
+
+async def _enrich_from_edgar(ticker: str, yf_data: dict[str, Any]) -> dict[str, Any]:
+    """Fill gaps in *yf_data* using SEC EDGAR XBRL facts.
+
+    Only overwrites None values — yfinance is preferred when available.
+    """
+    facts = await _fetch_edgar_facts(ticker)
+    if facts is None:
+        return yf_data
+
+    data = dict(yf_data)  # shallow copy
+
+    # Revenue (for growth calc)
+    if data["rev_growth"] is None:
+        latest, prev = _two_latest_annual_facts(facts, "us-gaap", "Revenues")
+        if latest is None or prev is None:
+            latest, prev = _two_latest_annual_facts(facts, "us-gaap", "RevenueFromContractWithCustomerExcludingAssessedTax")
+        if latest is not None and prev is not None and prev != 0:
+            data["rev_growth"] = round((latest - prev) / abs(prev) * 100, 2)
+
+    # EPS
+    if data["eps"] is None:
+        eps_val = _latest_fact(facts, "us-gaap", "EarningsPerShareDiluted")
+        if eps_val is None:
+            eps_val = _latest_fact(facts, "us-gaap", "EarningsPerShareBasic")
+        data["eps"] = _safe_round(eps_val)
+
+    # Net income for ROE / margin
+    net_income = _latest_fact(facts, "us-gaap", "NetIncomeLoss")
+
+    # ROE
+    if data["roe"] is None and net_income is not None:
+        equity = _latest_fact(facts, "us-gaap", "StockholdersEquity")
+        if equity and equity != 0:
+            data["roe"] = round(net_income / equity * 100, 2)
+
+    # D/E
+    if data["de"] is None:
+        debt = _latest_fact(facts, "us-gaap", "LongTermDebt")
+        if debt is None:
+            debt = _latest_fact(facts, "us-gaap", "LongTermDebtNoncurrent")
+        equity = _latest_fact(facts, "us-gaap", "StockholdersEquity")
+        if debt is not None and equity and equity != 0:
+            data["de"] = round(debt / equity, 2)
+
+    # FCF
+    if data["fcf"] is None:
+        ocf = _latest_fact(facts, "us-gaap", "NetCashProvidedByOperatingActivities")
+        capex = _latest_fact(facts, "us-gaap", "PaymentsToAcquirePropertyPlantAndEquipment")
+        if ocf is not None and capex is not None:
+            data["fcf"] = round(ocf - capex, 0)
+        elif ocf is not None:
+            data["fcf"] = round(ocf, 0)
+
+    # Profit margin
+    if data["margin"] is None and net_income is not None:
+        revenue = _latest_fact(facts, "us-gaap", "Revenues")
+        if revenue is None:
+            revenue = _latest_fact(facts, "us-gaap", "RevenueFromContractWithCustomerExcludingAssessedTax")
+        if revenue and revenue != 0:
+            data["margin"] = round(net_income / revenue * 100, 2)
+
+    return data
+
+
+# ── public API ───────────────────────────────────────────────────────────────
 
 async def get_fundamental_metrics(ticker: str) -> dict:
     """Calculate key fundamental metrics for a stock.
@@ -29,126 +335,126 @@ async def get_fundamental_metrics(ticker: str) -> dict:
     - profit_margin: Net profit margin (percentage)
     - payout_ratio: Dividend payout ratio (percentage)
 
+    Data sourced from yfinance (primary) with SEC EDGAR XBRL fallback.
+
     Use this to evaluate a stock's valuation, financial health, and quality.
     P/E < 20 is generally reasonable; PEG < 1 suggests undervaluation relative
     to growth; ROE > 15% signals quality; D/E > 2 is risky.
     """
 
     async def _fetch():
-        # ── MOCK DATA — replace with yfinance later ──
-        mock_fundamentals = {
-            "AAPL": {"pe": 28.5, "pb": 45.2, "peg": 2.1, "de": 1.8, "fcf": 111e9, "roe": 160, "div": 0.5, "rev_g": 3.5, "eps": 6.50, "margin": 26.3, "payout": 15.0},
-            "MSFT": {"pe": 35.2, "pb": 12.8, "peg": 2.0, "de": 0.4, "fcf": 63e9, "roe": 43, "div": 0.7, "rev_g": 15.2, "eps": 11.90, "margin": 36.5, "payout": 25.0},
-            "GOOGL": {"pe": 24.1, "pb": 6.5, "peg": 1.3, "de": 0.1, "fcf": 69e9, "roe": 28, "div": 0.0, "rev_g": 12.8, "eps": 7.30, "margin": 25.1, "payout": 0},
-            "AMZN": {"pe": 62.3, "pb": 8.2, "peg": 1.5, "de": 0.7, "fcf": 35e9, "roe": 22, "div": 0.0, "rev_g": 11.5, "eps": 3.15, "margin": 6.2, "payout": 0},
-            "NVDA": {"pe": 65.0, "pb": 55.0, "peg": 0.9, "de": 0.4, "fcf": 28e9, "roe": 115, "div": 0.02, "rev_g": 122.0, "eps": 13.60, "margin": 55.0, "payout": 1.5},
-            "META": {"pe": 27.5, "pb": 8.3, "peg": 1.1, "de": 0.2, "fcf": 43e9, "roe": 33, "div": 0.3, "rev_g": 24.7, "eps": 18.50, "margin": 35.0, "payout": 8.0},
-            "TSLA": {"pe": 70.0, "pb": 16.0, "peg": 3.5, "de": 0.1, "fcf": 4.4e9, "roe": 22, "div": 0.0, "rev_g": 18.8, "eps": 3.50, "margin": 10.2, "payout": 0},
-            "JPM": {"pe": 12.0, "pb": 1.8, "peg": 1.5, "de": 1.2, "fcf": 30e9, "roe": 17, "div": 2.4, "rev_g": 8.5, "eps": 16.50, "margin": 33.0, "payout": 27.0},
-            "V": {"pe": 30.5, "pb": 13.5, "peg": 1.8, "de": 0.6, "fcf": 18e9, "roe": 47, "div": 0.7, "rev_g": 10.5, "eps": 9.35, "margin": 53.0, "payout": 22.0},
-            "JNJ": {"pe": 15.2, "pb": 5.8, "peg": 2.5, "de": 0.4, "fcf": 18e9, "roe": 25, "div": 3.0, "rev_g": 4.2, "eps": 10.20, "margin": 21.5, "payout": 45.0},
-            "UNH": {"pe": 22.0, "pb": 6.2, "peg": 1.5, "de": 0.7, "fcf": 22e9, "roe": 25, "div": 1.4, "rev_g": 13.0, "eps": 23.70, "margin": 6.5, "payout": 30.0},
-            "HD": {"pe": 24.0, "pb": 1000, "peg": 2.2, "de": 50.0, "fcf": 16e9, "roe": 1500, "div": 2.3, "rev_g": 3.0, "eps": 15.80, "margin": 10.5, "payout": 55.0},
-            "PG": {"pe": 26.0, "pb": 7.8, "peg": 3.0, "de": 0.7, "fcf": 15e9, "roe": 30, "div": 2.4, "rev_g": 3.5, "eps": 6.35, "margin": 18.5, "payout": 62.0},
-            "MA": {"pe": 35.0, "pb": 60.0, "peg": 1.9, "de": 2.0, "fcf": 12e9, "roe": 180, "div": 0.5, "rev_g": 12.0, "eps": 13.15, "margin": 46.0, "payout": 18.0},
-            "XOM": {"pe": 12.5, "pb": 2.1, "peg": 2.0, "de": 0.2, "fcf": 36e9, "roe": 20, "div": 3.3, "rev_g": -5.0, "eps": 8.85, "margin": 10.8, "payout": 40.0},
-        }
-
-        if ticker.upper() in mock_fundamentals:
-            d = mock_fundamentals[ticker.upper()]
-        else:
-            # Generate random but plausible fundamentals
-            d = {
-                "pe": round(random.uniform(8, 80), 1),
-                "pb": round(random.uniform(0.5, 20), 1),
-                "peg": round(random.uniform(0.5, 4), 1),
-                "de": round(random.uniform(0.1, 3), 1),
-                "fcf": round(random.uniform(1e9, 50e9), 0),
-                "roe": round(random.uniform(5, 50), 0),
-                "div": round(random.uniform(0, 4), 1),
-                "rev_g": round(random.uniform(-10, 40), 1),
-                "eps": round(random.uniform(1, 20), 2),
-                "margin": round(random.uniform(5, 40), 1),
-                "payout": round(random.uniform(0, 60), 0),
+        try:
+            t = _yf_ticker(ticker)
+            yf_data = await asyncio.to_thread(_extract_yf_fundamentals, t)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("yfinance fundamentals failed for %s: %s — trying SEC EDGAR only", ticker, exc)
+            yf_data = {
+                "market_cap": None, "pe": None, "pb": None, "peg": None,
+                "de": None, "fcf": None, "roe": None, "div_yield": None,
+                "rev_growth": None, "eps": None, "margin": None, "payout": None,
             }
+
+        # Enrich missing fields from SEC EDGAR
+        data = await _enrich_from_edgar(ticker, yf_data)
+
+        pe = _safe_round(data["pe"], 2)
+        peg = _safe_round(data["peg"], 2)
+        pb = _safe_round(data["pb"], 2)
+        de = _safe_round(data["de"], 2)
+        fcf = _safe_round(data["fcf"], 0)
+        roe = _safe_round(data["roe"], 2)
 
         return {
             "ticker": ticker.upper(),
-            "market_cap": round(random.uniform(50e9, 3e12), 0),
-            "pe_ratio": d["pe"],
-            "pb_ratio": d["pb"],
-            "peg_ratio": d["peg"],
-            "debt_to_equity": d["de"],
-            "free_cash_flow": d["fcf"],
-            "roe": d["roe"],
-            "dividend_yield": d["div"],
-            "revenue_growth": d["rev_g"],
-            "earnings_per_share": d["eps"],
-            "profit_margin": d["margin"],
-            "payout_ratio": d["payout"],
-            "valuation_summary": _valuation_summary(d["pe"], d["peg"], d["pb"]),
-            "health_summary": _health_summary(d["de"], d["fcf"]),
-            "quality_summary": _quality_summary(d["roe"], d["rev_g"], d["div"]),
+            "market_cap": _safe_round(data["market_cap"], 0),
+            "pe_ratio": pe,
+            "pb_ratio": pb,
+            "peg_ratio": peg,
+            "debt_to_equity": de,
+            "free_cash_flow": fcf,
+            "roe": roe,
+            "dividend_yield": _safe_round(data["div_yield"], 2),
+            "revenue_growth": _safe_round(data["rev_growth"], 2),
+            "earnings_per_share": _safe_round(data["eps"], 2),
+            "profit_margin": _safe_round(data["margin"], 2),
+            "payout_ratio": _safe_round(data["payout"], 2),
+            "valuation_summary": _valuation_summary(pe, peg, pb),
+            "health_summary": _health_summary(de, fcf),
+            "quality_summary": _quality_summary(roe, data.get("rev_growth"), data.get("div_yield")),
         }
 
     return await async_get_or_set(fundamental_cache, f"fund:{ticker.upper()}", _fetch)
 
 
-def _valuation_summary(pe: float, peg: float, pb: float) -> str:
+def _valuation_summary(pe: float | None, peg: float | None, pb: float | None) -> str:
     parts = []
-    if pe < 15:
-        parts.append("attractively valued (low P/E)")
-    elif pe < 25:
-        parts.append("reasonably valued")
+    if pe is not None:
+        if pe < 15:
+            parts.append("attractively valued (low P/E)")
+        elif pe < 25:
+            parts.append("reasonably valued")
+        else:
+            parts.append("premium valuation (high P/E)")
     else:
-        parts.append("premium valuation (high P/E)")
+        parts.append("P/E data unavailable")
 
-    if peg < 1:
-        parts.append("undervalued relative to growth (PEG < 1)")
-    elif peg < 1.5:
-        parts.append("fairly priced for growth")
-    else:
-        parts.append("growth may be priced in")
+    if peg is not None:
+        if peg < 1:
+            parts.append("undervalued relative to growth (PEG < 1)")
+        elif peg < 1.5:
+            parts.append("fairly priced for growth")
+        else:
+            parts.append("growth may be priced in")
 
     return "; ".join(parts)
 
 
-def _health_summary(de: float, fcf: float) -> str:
+def _health_summary(de: float | None, fcf: float | None) -> str:
     parts = []
-    if de < 0.5:
-        parts.append("very low leverage")
-    elif de < 1.5:
-        parts.append("manageable debt levels")
+    if de is not None:
+        if de < 0.5:
+            parts.append("very low leverage")
+        elif de < 1.5:
+            parts.append("manageable debt levels")
+        else:
+            parts.append("high leverage — elevated financial risk")
     else:
-        parts.append("high leverage — elevated financial risk")
+        parts.append("debt data unavailable")
 
-    if fcf > 10e9:
-        parts.append("strong cash generation")
-    elif fcf > 0:
-        parts.append("positive free cash flow")
+    if fcf is not None:
+        if fcf > 10e9:
+            parts.append("strong cash generation")
+        elif fcf > 0:
+            parts.append("positive free cash flow")
+        else:
+            parts.append("negative FCF — cash burn risk")
     else:
-        parts.append("negative FCF — cash burn risk")
+        parts.append("FCF data unavailable")
 
     return "; ".join(parts)
 
 
-def _quality_summary(roe: float, rev_g: float, div_yield: float) -> str:
+def _quality_summary(roe: float | None, rev_g: float | None, div_yield: float | None) -> str:
     parts = []
-    if roe > 20:
-        parts.append("high-quality business (strong ROE)")
-    elif roe > 10:
-        parts.append("decent returns on equity")
+    if roe is not None:
+        if roe > 20:
+            parts.append("high-quality business (strong ROE)")
+        elif roe > 10:
+            parts.append("decent returns on equity")
+        else:
+            parts.append("low ROE — management effectiveness questionable")
     else:
-        parts.append("low ROE — management effectiveness questionable")
+        parts.append("ROE data unavailable")
 
-    if rev_g > 15:
-        parts.append("strong revenue growth")
-    elif rev_g > 0:
-        parts.append("moderate growth")
-    else:
-        parts.append("declining revenue")
+    if rev_g is not None:
+        if rev_g > 15:
+            parts.append("strong revenue growth")
+        elif rev_g > 0:
+            parts.append("moderate growth")
+        else:
+            parts.append("declining revenue")
 
-    if div_yield > 2:
+    if div_yield is not None and div_yield > 2:
         parts.append(f"attractive {div_yield}% dividend yield")
 
     return "; ".join(parts)

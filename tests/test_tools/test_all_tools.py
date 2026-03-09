@@ -49,9 +49,24 @@ async def test_get_company_info():
 async def test_get_fundamentals():
     result = await get_fundamental_metrics("NVDA")
     assert result["ticker"] == "NVDA"
-    assert "pe_ratio" in result
-    assert "roe" in result
-    assert "valuation_summary" in result
+    # Core fields must be present (may be None if data unavailable)
+    for key in ("pe_ratio", "pb_ratio", "peg_ratio", "debt_to_equity",
+                "free_cash_flow", "roe", "dividend_yield", "revenue_growth",
+                "earnings_per_share", "profit_margin", "payout_ratio",
+                "market_cap", "valuation_summary", "health_summary",
+                "quality_summary"):
+        assert key in result, f"Missing key: {key}"
+    # At least some metrics should be populated for a major stock
+    populated = sum(1 for k in ("pe_ratio", "roe", "market_cap") if result[k] is not None)
+    assert populated >= 1, "Expected at least one core metric to be non-None for NVDA"
+
+
+@pytest.mark.asyncio
+async def test_get_fundamentals_summaries():
+    result = await get_fundamental_metrics("AAPL")
+    assert isinstance(result["valuation_summary"], str)
+    assert isinstance(result["health_summary"], str)
+    assert isinstance(result["quality_summary"], str)
 
 
 # ── Technicals ───────────────────────────────────────────
