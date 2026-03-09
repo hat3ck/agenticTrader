@@ -13,6 +13,8 @@ class Settings(BaseSettings):
     app_env: str = "development"
     log_level: str = "INFO"
 
+    alpha_vantage_api_key: str | None = Field(default=None, description="Alpha Vantage API key (free tier, 500 calls/day) — used as fallback when yfinance is unreliable")
+
     market_data_cache_ttl: int = 900       # 15 minutes
     fundamental_data_cache_ttl: int = 86400  # 24 hours
     sentiment_cache_ttl: int = 3600        # 1 hour
