@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     alpha_vantage_api_key: str | None = Field(default=None, description="Alpha Vantage API key (free tier, 500 calls/day) — used as fallback when yfinance is unreliable")
     sec_edgar_user_agent: str = Field(default="AgenticTrader/0.1 (agentic-trader@example.com)", description="SEC EDGAR requires a User-Agent with app name and contact email")
 
+    news_api_key: str | None = Field(default=None, description="NewsAPI.org API key (free tier, 100 requests/day) — recent headlines & sentiment")
+    fred_api_key: str | None = Field(default=None, description="FRED API key (free, api.stlouisfed.org) — macroeconomic indicators")
+
     market_data_cache_ttl: int = 900       # 15 minutes
     fundamental_data_cache_ttl: int = 86400  # 24 hours
     sentiment_cache_ttl: int = 3600        # 1 hour
