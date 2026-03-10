@@ -120,7 +120,7 @@ async def tool_screen_stocks(
     risk_tolerance: str = "moderate",
     sector_preferences: list[str] | None = None,
     excluded_tickers: list[str] | None = None,
-    market_cap_range: str = "large_and_above",
+    market_cap_range: str = "auto",
     min_avg_daily_volume: int = 500_000,
     exchanges: list[str] | None = None,
     max_pe_ratio: float = 50.0,
@@ -129,14 +129,31 @@ async def tool_screen_stocks(
 ) -> dict:
     """Screen the stock universe and return 10-30 filtered candidates. Call this FIRST.
 
-    Filters by market cap range (mega/large/mid/small/large_and_above/mid_and_above/all),
+    Filters by market cap range (mega/large/mid/small/large_and_above/mid_and_above/all/auto),
     sector, exchange (NYSE/NASDAQ), minimum average daily volume (liquidity),
     and maximum P/E ratio (exclude extreme valuations).
-    indices can be ["sp500"], ["nasdaq100"], or ["russell2000"].
+    indices can be ["sp500"], ["nasdaq100"], ["sp400"], ["sp600"], or ["russell2000"].
+
+    When market_cap_range is "auto" (default), it is determined by the user's
+    risk tolerance:
+      • conservative  → large_and_above (≥$10B)
+      • moderate      → mid_and_above   (≥$2B)
+      • aggressive    → all             (≥$300M, includes small-cap)
     """
     deps = ctx.deps
+
+    # ── Auto-adjust market_cap_range based on risk tolerance ─────────
+    _RISK_TO_CAP: dict[str, str] = {
+        "conservative": "large_and_above",
+        "moderate":     "mid_and_above",
+        "aggressive":   "all",
+    }
+    effective_risk = risk_tolerance or deps.risk_tolerance.value
+    if market_cap_range == "auto":
+        market_cap_range = _RISK_TO_CAP.get(effective_risk, "mid_and_above")
+
     return await screen_stocks(
-        risk_tolerance=risk_tolerance or deps.risk_tolerance.value,
+        risk_tolerance=effective_risk,
         sector_preferences=sector_preferences or deps.sector_preferences or None,
         excluded_tickers=excluded_tickers or deps.excluded_tickers or None,
         market_cap_range=market_cap_range,
@@ -268,6 +285,16 @@ async def _backfill_analysis_metrics(
 ) -> AnalysisResponse:
     """Replace LLM-generated key_metrics with real tool data for an analysis."""
     response.key_metrics = await _fetch_real_key_metrics(response.ticker)
+
+    # Overwrite company_name with real data to prevent hallucination
+    try:
+        company_info = await get_company_info(response.ticker)
+        real_name = company_info.get("name")
+        if real_name:
+            response.company_name = real_name
+    except Exception:
+        logger.warning("Could not backfill company name for %s", response.ticker)
+
     return response
 
 
@@ -346,7 +373,22 @@ async def run_analyze(
         cash_reserve_pct=get_cash_reserve_pct(horizon),
     )
 
+    # Pre-fetch company info so the LLM cannot hallucinate the company identity
+    try:
+        company_info = await get_company_info(ticker)
+        company_context = (
+            f"Verified company information for {ticker.upper()}:\n"
+            f"  Company Name: {company_info.get('name', ticker.upper())}\n"
+            f"  Sector: {company_info.get('sector', 'Unknown')}\n"
+            f"  Industry: {company_info.get('industry', 'Unknown')}\n"
+            f"  Description: {company_info.get('description', 'N/A')}\n\n"
+        )
+    except Exception:
+        logger.warning("Could not pre-fetch company info for %s", ticker)
+        company_context = ""
+
     user_prompt = (
+        f"{company_context}"
         f"Perform a comprehensive analysis of {ticker.upper()} for a "
         f"{horizon.value.replace('_', ' ')} investment horizon. "
         "Include fundamental analysis, technical analysis, and sentiment analysis. "

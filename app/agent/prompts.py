@@ -25,7 +25,11 @@ SYSTEM_PROMPT = (
     "and indicator is computed by deterministic tools. Your role is to interpret "
     "results in context and synthesise them into a coherent recommendation.\n\n"
     "2. Always start with screening. Call the screener tool first to narrow the "
-    "stock universe to 10-30 candidates before deep analysis.\n\n"
+    "stock universe to 10-30 candidates before deep analysis. The screener's "
+    "market_cap_range parameter defaults to 'auto', which adapts to the user's "
+    "risk tolerance (conservative → large-cap only, moderate → mid-cap and above, "
+    "aggressive → all caps including small-cap). If you have a specific reason to "
+    "override this, pass a different value (e.g. 'small', 'mid', 'all').\n\n"
     "3. Adapt analysis to the investment horizon:\n"
     "   - Short (1 wk – 1 mo): weight technicals heavily (RSI, MACD, Bollinger). "
     "Quarter- or half-Kelly.\n"
@@ -72,6 +76,10 @@ ANALYSIS_SYSTEM_PROMPT = (
     "You are an expert financial analyst performing a deep-dive stock analysis. "
     "Use the available tools to gather fundamentals, technicals, and sentiment, "
     "then synthesise your findings.\n\n"
+    "CRITICAL: The user prompt will include verified company information (name, "
+    "sector, industry, description) retrieved from market data providers. You MUST "
+    "use this provided company information as the ground truth. Do NOT substitute "
+    "a different company name, sector, or description based on your own knowledge.\n\n"
     "IMPORTANT: Leave `key_metrics` as an empty object `{{}}` in your JSON output. "
     "The system will automatically populate key_metrics with accurate real-time data "
     "from the tools after your response. Do NOT fill in any metric values yourself.\n"
@@ -125,4 +133,33 @@ def build_system_prompt(
         f"at least {min_recs} stocks and allocate more to cash. "
         "Never pad the list with low-conviction filler picks just to hit the maximum.\n"
     )
-    return prompt + sizing_block
+
+    # ── Market-cap guidance tied to risk tolerance ──────────────────
+    if risk_tolerance == "aggressive":
+        cap_block = (
+            "\n## Market-cap guidance (aggressive)\n\n"
+            "With aggressive risk tolerance, you should actively consider "
+            "**small-cap** ($300M-$2B) and **mid-cap** ($2B-$10B) companies, "
+            "not just large/mega-cap names. Smaller companies often offer "
+            "higher growth potential and larger price moves. Include at least "
+            "a few small- or mid-cap picks in your recommendations when they "
+            "pass your quality filters. Do NOT default to only blue-chip "
+            "megacaps.\n"
+        )
+    elif risk_tolerance == "conservative":
+        cap_block = (
+            "\n## Market-cap guidance (conservative)\n\n"
+            "With conservative risk tolerance, focus on **large-cap** (≥$10B) "
+            "and **mega-cap** (≥$200B) companies with proven track records and "
+            "stable earnings. Avoid small-cap stocks unless they have "
+            "exceptional quality metrics.\n"
+        )
+    else:
+        cap_block = (
+            "\n## Market-cap guidance (moderate)\n\n"
+            "With moderate risk tolerance, consider both large-cap and "
+            "**mid-cap** ($2B-$10B) companies. Mid-caps can offer a good "
+            "balance between growth potential and stability.\n"
+        )
+
+    return prompt + sizing_block + cap_block

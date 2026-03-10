@@ -113,7 +113,7 @@ def _normalize_fmp_constituent(raw: dict, index_tag: str) -> StockEntry | None:
 
 
 async def _fetch_fmp_universe() -> list[StockEntry] | None:
-    """Fetch S&P 500 + NASDAQ constituents from FMP and merge them.
+    """Fetch S&P 500 + NASDAQ + small/mid-cap stocks from FMP and merge them.
 
     Returns None if the API key is missing or calls fail.
     """
@@ -146,13 +146,79 @@ async def _fetch_fmp_universe() -> list[StockEntry] | None:
             else:
                 stock_map[entry["ticker"]] = entry
 
+    # Fetch small/mid-cap stocks via stock screener (market cap $300M–$10B)
+    smid_stocks = await _fetch_fmp_smallmid_screener()
+    for entry in (smid_stocks or []):
+        if entry["ticker"] not in stock_map:
+            stock_map[entry["ticker"]] = entry
+
     result = list(stock_map.values())
     if len(result) < 50:
         logger.warning("FMP returned only %d stocks, seems too few — using fallback", len(result))
         return None
 
-    logger.info("FMP: loaded %d stocks dynamically (S&P 500 + NASDAQ)", len(result))
+    logger.info("FMP: loaded %d stocks dynamically (S&P 500 + NASDAQ + small/mid-cap)", len(result))
     return result
+
+
+async def _fetch_fmp_smallmid_screener() -> list[StockEntry] | None:
+    """Fetch small/mid-cap US stocks using FMP's stock screener endpoint.
+
+    Targets market cap range $300M–$10B on NYSE/NASDAQ with reasonable
+    volume to avoid illiquid penny stocks.
+    """
+    api_key = settings.fmp_api_key
+    if not api_key:
+        return None
+
+    url = (
+        f"{_FMP_BASE}/stock-screener"
+        f"?marketCapMoreThan=300000000"
+        f"&marketCapLowerThan=10000000000"
+        f"&volumeMoreThan=200000"
+        f"&exchange=NYSE,NASDAQ"
+        f"&isActivelyTrading=true"
+        f"&limit=500"
+        f"&apikey={api_key}"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            data = resp.json()
+            if not isinstance(data, list):
+                return None
+
+        result: list[StockEntry] = []
+        for raw in data:
+            ticker = raw.get("symbol")
+            if not ticker or "." in ticker:  # skip class shares like BRK.B
+                continue
+            name = raw.get("companyName", "")
+            sector = raw.get("sector") or "Unknown"
+            exchange = _EXCHANGE_MAP.get(raw.get("exchangeShortName", ""), "NYSE")
+            market_cap = raw.get("marketCap")
+            cap_tier = _classify_cap_tier(market_cap)
+
+            # Only keep mid and small cap stocks (large/mega already in S&P 500)
+            if cap_tier not in ("mid", "small"):
+                continue
+
+            index_tag = "sp400" if cap_tier == "mid" else "sp600"
+            result.append({
+                "ticker": ticker.upper(),
+                "name": name,
+                "sector": sector,
+                "exchange": exchange,
+                "cap_tier": cap_tier,
+                "indices": [index_tag],
+            })
+
+        logger.info("FMP screener: loaded %d small/mid-cap stocks", len(result))
+        return result if result else None
+    except Exception:
+        logger.exception("FMP stock screener request failed")
+        return None
 
 
 # ── Wikipedia scraping ────────────────────────────────────────────────────────
@@ -352,18 +418,128 @@ async def _fetch_wikipedia_nasdaq100() -> list[dict] | None:
         return None
 
 
-async def _fetch_wikipedia_universe() -> list[StockEntry] | None:
-    """Fetch S&P 500 + NASDAQ-100 from Wikipedia and merge them.
+async def _fetch_wikipedia_sp400() -> list[dict] | None:
+    """Scrape the S&P MidCap 400 constituent table from Wikipedia."""
+    try:
+        params = {
+            "action": "parse",
+            "page": "List_of_S&P_400_companies",
+            "prop": "text",
+            "section": "1",
+            "format": "json",
+            "formatversion": "2",
+        }
+        async with httpx.AsyncClient(timeout=20, headers=_WIKI_HEADERS) as client:
+            resp = await client.get(_WIKI_API, params=params)
+            resp.raise_for_status()
+            data = resp.json()
 
-    Returns None if scraping fails for both indices.
+        html = data.get("parse", {}).get("text", "")
+        if not html:
+            logger.warning("Wikipedia S&P 400 API returned no HTML")
+            return None
+
+        tables = await asyncio.to_thread(pd.read_html, StringIO(html))
+        if not tables:
+            return None
+
+        df = max(tables, key=len)
+
+        sym_col = next((c for c in df.columns if "symbol" in str(c).lower() or "ticker" in str(c).lower()), None)
+        name_col = next((c for c in df.columns if "company" in str(c).lower() or "security" in str(c).lower()), None)
+        sector_col = next((c for c in df.columns if "sector" in str(c).lower()), None)
+
+        if sym_col is None:
+            logger.warning("Wikipedia S&P 400: could not find symbol column in %s", list(df.columns))
+            return None
+
+        result = []
+        for _, row in df.iterrows():
+            ticker = str(row[sym_col]).strip().replace(".", "-")
+            if not ticker or ticker == "nan":
+                continue
+            name = str(row[name_col]).strip() if name_col else ""
+            sector = _normalize_wiki_sector(str(row[sector_col])) if sector_col else "Unknown"
+            result.append({
+                "ticker": ticker.upper(),
+                "name": name,
+                "sector": sector,
+                "index": "sp400",
+            })
+        return result if result else None
+    except Exception:
+        logger.exception("Wikipedia S&P 400 scrape failed")
+        return None
+
+
+async def _fetch_wikipedia_sp600() -> list[dict] | None:
+    """Scrape the S&P SmallCap 600 constituent table from Wikipedia."""
+    try:
+        params = {
+            "action": "parse",
+            "page": "List_of_S&P_600_companies",
+            "prop": "text",
+            "section": "1",
+            "format": "json",
+            "formatversion": "2",
+        }
+        async with httpx.AsyncClient(timeout=20, headers=_WIKI_HEADERS) as client:
+            resp = await client.get(_WIKI_API, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+
+        html = data.get("parse", {}).get("text", "")
+        if not html:
+            logger.warning("Wikipedia S&P 600 API returned no HTML")
+            return None
+
+        tables = await asyncio.to_thread(pd.read_html, StringIO(html))
+        if not tables:
+            return None
+
+        df = max(tables, key=len)
+
+        sym_col = next((c for c in df.columns if "symbol" in str(c).lower() or "ticker" in str(c).lower()), None)
+        name_col = next((c for c in df.columns if "company" in str(c).lower() or "security" in str(c).lower()), None)
+        sector_col = next((c for c in df.columns if "sector" in str(c).lower()), None)
+
+        if sym_col is None:
+            logger.warning("Wikipedia S&P 600: could not find symbol column in %s", list(df.columns))
+            return None
+
+        result = []
+        for _, row in df.iterrows():
+            ticker = str(row[sym_col]).strip().replace(".", "-")
+            if not ticker or ticker == "nan":
+                continue
+            name = str(row[name_col]).strip() if name_col else ""
+            sector = _normalize_wiki_sector(str(row[sector_col])) if sector_col else "Unknown"
+            result.append({
+                "ticker": ticker.upper(),
+                "name": name,
+                "sector": sector,
+                "index": "sp600",
+            })
+        return result if result else None
+    except Exception:
+        logger.exception("Wikipedia S&P 600 scrape failed")
+        return None
+
+
+async def _fetch_wikipedia_universe() -> list[StockEntry] | None:
+    """Fetch S&P 500 + NASDAQ-100 + S&P 400 + S&P 600 from Wikipedia and merge.
+
+    Returns None if scraping fails for all indices.
     """
-    sp500_raw, nasdaq_raw = await asyncio.gather(
+    sp500_raw, nasdaq_raw, sp400_raw, sp600_raw = await asyncio.gather(
         _fetch_wikipedia_sp500(),
         _fetch_wikipedia_nasdaq100(),
+        _fetch_wikipedia_sp400(),
+        _fetch_wikipedia_sp600(),
     )
 
-    if not sp500_raw and not nasdaq_raw:
-        logger.warning("Wikipedia: both scrapes returned no data")
+    if not sp500_raw and not nasdaq_raw and not sp400_raw and not sp600_raw:
+        logger.warning("Wikipedia: all scrapes returned no data")
         return None
 
     stock_map: dict[str, StockEntry] = {}
@@ -395,12 +571,42 @@ async def _fetch_wikipedia_universe() -> list[StockEntry] | None:
                 "indices": ["nasdaq100"],
             }
 
+    for raw in (sp400_raw or []):
+        ticker = raw["ticker"]
+        if ticker in stock_map:
+            if "sp400" not in stock_map[ticker]["indices"]:
+                stock_map[ticker]["indices"].append("sp400")
+        else:
+            stock_map[ticker] = {
+                "ticker": ticker,
+                "name": raw.get("name", ""),
+                "sector": raw.get("sector", "Unknown"),
+                "exchange": "NASDAQ" if ticker in _KNOWN_NASDAQ else "NYSE",
+                "cap_tier": "mid",  # S&P 400 = mid-cap
+                "indices": ["sp400"],
+            }
+
+    for raw in (sp600_raw or []):
+        ticker = raw["ticker"]
+        if ticker in stock_map:
+            if "sp600" not in stock_map[ticker]["indices"]:
+                stock_map[ticker]["indices"].append("sp600")
+        else:
+            stock_map[ticker] = {
+                "ticker": ticker,
+                "name": raw.get("name", ""),
+                "sector": raw.get("sector", "Unknown"),
+                "exchange": "NASDAQ" if ticker in _KNOWN_NASDAQ else "NYSE",
+                "cap_tier": "small",  # S&P 600 = small-cap
+                "indices": ["sp600"],
+            }
+
     result = list(stock_map.values())
     if len(result) < 50:
         logger.warning("Wikipedia returned only %d stocks — using fallback", len(result))
         return None
 
-    logger.info("Wikipedia: loaded %d stocks dynamically (S&P 500 + NASDAQ-100)", len(result))
+    logger.info("Wikipedia: loaded %d stocks dynamically (S&P 500 + NASDAQ-100 + S&P 400 + S&P 600)", len(result))
     return result
 
 
@@ -691,6 +897,74 @@ _UNIVERSE: list[StockEntry] = [
     {"ticker": "NUE",   "name": "Nucor Corp.",                "sector": "Basic Materials", "exchange": "NYSE", "cap_tier": "large", "indices": ["sp500"]},
     {"ticker": "DOW",   "name": "Dow Inc.",                   "sector": "Basic Materials", "exchange": "NYSE", "cap_tier": "large", "indices": ["sp500"]},
     {"ticker": "PPG",   "name": "PPG Industries",             "sector": "Basic Materials", "exchange": "NYSE", "cap_tier": "large", "indices": ["sp500"]},
+
+    # ── S&P MidCap 400 (mid-cap, $2B–$10B) ──────────────────────────────────
+    {"ticker": "MANH",  "name": "Manhattan Associates",       "sector": "Technology",     "exchange": "NASDAQ", "cap_tier": "mid",   "indices": ["sp400"]},
+    {"ticker": "OKTA",  "name": "Okta Inc.",                  "sector": "Technology",     "exchange": "NASDAQ", "cap_tier": "mid",   "indices": ["sp400"]},
+    {"ticker": "TWLO",  "name": "Twilio Inc.",                "sector": "Technology",     "exchange": "NYSE",   "cap_tier": "mid",   "indices": ["sp400"]},
+    {"ticker": "DT",    "name": "Dynatrace Inc.",             "sector": "Technology",     "exchange": "NYSE",   "cap_tier": "mid",   "indices": ["sp400"]},
+    {"ticker": "NTNX",  "name": "Nutanix Inc.",               "sector": "Technology",     "exchange": "NASDAQ", "cap_tier": "mid",   "indices": ["sp400"]},
+    {"ticker": "DBX",   "name": "Dropbox Inc.",               "sector": "Technology",     "exchange": "NASDAQ", "cap_tier": "mid",   "indices": ["sp400"]},
+    {"ticker": "PATH",  "name": "UiPath Inc.",                "sector": "Technology",     "exchange": "NYSE",   "cap_tier": "mid",   "indices": ["sp400"]},
+    {"ticker": "SLAB",  "name": "Silicon Labs",               "sector": "Technology",     "exchange": "NASDAQ", "cap_tier": "mid",   "indices": ["sp400"]},
+    {"ticker": "CRUS",  "name": "Cirrus Logic",               "sector": "Technology",     "exchange": "NASDAQ", "cap_tier": "mid",   "indices": ["sp400"]},
+    {"ticker": "COHR",  "name": "Coherent Corp.",             "sector": "Technology",     "exchange": "NYSE",   "cap_tier": "mid",   "indices": ["sp400"]},
+    {"ticker": "DUOL",  "name": "Duolingo Inc.",              "sector": "Consumer Cyclical", "exchange": "NASDAQ", "cap_tier": "mid", "indices": ["sp400"]},
+    {"ticker": "WING",  "name": "Wingstop Inc.",              "sector": "Consumer Cyclical", "exchange": "NASDAQ", "cap_tier": "mid", "indices": ["sp400"]},
+    {"ticker": "BURL",  "name": "Burlington Stores",          "sector": "Consumer Cyclical", "exchange": "NYSE", "cap_tier": "mid",  "indices": ["sp400"]},
+    {"ticker": "TOL",   "name": "Toll Brothers",              "sector": "Consumer Cyclical", "exchange": "NYSE", "cap_tier": "mid",  "indices": ["sp400"]},
+    {"ticker": "KBH",   "name": "KB Home",                    "sector": "Consumer Cyclical", "exchange": "NYSE", "cap_tier": "mid",  "indices": ["sp400"]},
+    {"ticker": "TXRH",  "name": "Texas Roadhouse",            "sector": "Consumer Cyclical", "exchange": "NASDAQ","cap_tier": "mid",  "indices": ["sp400"]},
+    {"ticker": "CAVA",  "name": "Cava Group",                 "sector": "Consumer Cyclical", "exchange": "NYSE", "cap_tier": "mid",  "indices": ["sp400"]},
+    {"ticker": "NBIX",  "name": "Neurocrine Biosciences",     "sector": "Healthcare",    "exchange": "NASDAQ", "cap_tier": "mid",   "indices": ["sp400"]},
+    {"ticker": "HALO",  "name": "Halozyme Therapeutics",      "sector": "Healthcare",    "exchange": "NASDAQ", "cap_tier": "mid",   "indices": ["sp400"]},
+    {"ticker": "EXEL",  "name": "Exelixis Inc.",              "sector": "Healthcare",    "exchange": "NASDAQ", "cap_tier": "mid",   "indices": ["sp400"]},
+    {"ticker": "MEDP",  "name": "Medpace Holdings",           "sector": "Healthcare",    "exchange": "NASDAQ", "cap_tier": "mid",   "indices": ["sp400"]},
+    {"ticker": "CYTK",  "name": "Cytokinetics Inc.",          "sector": "Healthcare",    "exchange": "NASDAQ", "cap_tier": "mid",   "indices": ["sp400"]},
+    {"ticker": "PCTY",  "name": "Paylocity Holding",          "sector": "Industrials",   "exchange": "NASDAQ", "cap_tier": "mid",   "indices": ["sp400"]},
+    {"ticker": "SAIA",  "name": "Saia Inc.",                  "sector": "Industrials",   "exchange": "NASDAQ", "cap_tier": "mid",   "indices": ["sp400"]},
+    {"ticker": "STRL",  "name": "Sterling Infrastructure",    "sector": "Industrials",   "exchange": "NASDAQ", "cap_tier": "mid",   "indices": ["sp400"]},
+    {"ticker": "EWBC",  "name": "East West Bancorp",          "sector": "Financial Services", "exchange": "NASDAQ", "cap_tier": "mid", "indices": ["sp400"]},
+    {"ticker": "WAL",   "name": "Western Alliance Bancorp",   "sector": "Financial Services", "exchange": "NYSE", "cap_tier": "mid",  "indices": ["sp400"]},
+    {"ticker": "KNSL",  "name": "Kinsale Capital Group",      "sector": "Financial Services", "exchange": "NYSE", "cap_tier": "mid",  "indices": ["sp400"]},
+    {"ticker": "SFM",   "name": "Sprouts Farmers Market",     "sector": "Consumer Defensive", "exchange": "NASDAQ", "cap_tier": "mid","indices": ["sp400"]},
+    {"ticker": "CELH",  "name": "Celsius Holdings",           "sector": "Consumer Defensive", "exchange": "NASDAQ", "cap_tier": "mid","indices": ["sp400"]},
+    {"ticker": "MTDR",  "name": "Matador Resources",          "sector": "Energy",        "exchange": "NYSE",   "cap_tier": "mid",   "indices": ["sp400"]},
+    {"ticker": "OVV",   "name": "Ovintiv Inc.",               "sector": "Energy",        "exchange": "NYSE",   "cap_tier": "mid",   "indices": ["sp400"]},
+    {"ticker": "CLF",   "name": "Cleveland-Cliffs",           "sector": "Basic Materials","exchange": "NYSE",   "cap_tier": "mid",   "indices": ["sp400"]},
+    {"ticker": "RPM",   "name": "RPM International",          "sector": "Basic Materials","exchange": "NYSE",   "cap_tier": "mid",   "indices": ["sp400"]},
+
+    # ── S&P SmallCap 600 (small-cap, $300M–$2B) ─────────────────────────────
+    {"ticker": "DOCN",  "name": "DigitalOcean Holdings",      "sector": "Technology",     "exchange": "NYSE",   "cap_tier": "small", "indices": ["sp600"]},
+    {"ticker": "CALX",  "name": "Calix Inc.",                 "sector": "Technology",     "exchange": "NYSE",   "cap_tier": "small", "indices": ["sp600"]},
+    {"ticker": "QTWO",  "name": "Q2 Holdings",                "sector": "Technology",     "exchange": "NYSE",   "cap_tier": "small", "indices": ["sp600"]},
+    {"ticker": "POWI",  "name": "Power Integrations",         "sector": "Technology",     "exchange": "NASDAQ", "cap_tier": "small", "indices": ["sp600"]},
+    {"ticker": "BOX",   "name": "Box Inc.",                   "sector": "Technology",     "exchange": "NYSE",   "cap_tier": "small", "indices": ["sp600"]},
+    {"ticker": "CRSR",  "name": "Corsair Gaming",             "sector": "Technology",     "exchange": "NASDAQ", "cap_tier": "small", "indices": ["sp600"]},
+    {"ticker": "SEDG",  "name": "SolarEdge Technologies",     "sector": "Technology",     "exchange": "NASDAQ", "cap_tier": "small", "indices": ["sp600"]},
+    {"ticker": "MARA",  "name": "MARA Holdings",              "sector": "Technology",     "exchange": "NASDAQ", "cap_tier": "small", "indices": ["sp600"]},
+    {"ticker": "CLSK",  "name": "CleanSpark Inc.",            "sector": "Technology",     "exchange": "NASDAQ", "cap_tier": "small", "indices": ["sp600"]},
+    {"ticker": "ENPH",  "name": "Enphase Energy",             "sector": "Technology",     "exchange": "NASDAQ", "cap_tier": "small", "indices": ["sp600"]},
+    {"ticker": "EAT",   "name": "Brinker International",      "sector": "Consumer Cyclical", "exchange": "NYSE", "cap_tier": "small", "indices": ["sp600"]},
+    {"ticker": "BOOT",  "name": "Boot Barn Holdings",         "sector": "Consumer Cyclical", "exchange": "NYSE", "cap_tier": "small", "indices": ["sp600"]},
+    {"ticker": "PENN",  "name": "Penn Entertainment",         "sector": "Consumer Cyclical", "exchange": "NASDAQ","cap_tier": "small", "indices": ["sp600"]},
+    {"ticker": "PLAY",  "name": "Dave & Buster's",            "sector": "Consumer Cyclical", "exchange": "NASDAQ","cap_tier": "small", "indices": ["sp600"]},
+    {"ticker": "SONO",  "name": "Sonos Inc.",                 "sector": "Consumer Cyclical", "exchange": "NASDAQ","cap_tier": "small", "indices": ["sp600"]},
+    {"ticker": "CORT",  "name": "Corcept Therapeutics",       "sector": "Healthcare",    "exchange": "NASDAQ", "cap_tier": "small", "indices": ["sp600"]},
+    {"ticker": "TGTX",  "name": "TG Therapeutics",            "sector": "Healthcare",    "exchange": "NASDAQ", "cap_tier": "small", "indices": ["sp600"]},
+    {"ticker": "INSP",  "name": "Inspire Medical Systems",    "sector": "Healthcare",    "exchange": "NYSE",   "cap_tier": "small", "indices": ["sp600"]},
+    {"ticker": "KRYS",  "name": "Krystal Biotech",            "sector": "Healthcare",    "exchange": "NASDAQ", "cap_tier": "small", "indices": ["sp600"]},
+    {"ticker": "ADMA",  "name": "ADMA Biologics",             "sector": "Healthcare",    "exchange": "NASDAQ", "cap_tier": "small", "indices": ["sp600"]},
+    {"ticker": "SKYW",  "name": "SkyWest Inc.",               "sector": "Industrials",   "exchange": "NASDAQ", "cap_tier": "small", "indices": ["sp600"]},
+    {"ticker": "POWL",  "name": "Powell Industries",          "sector": "Industrials",   "exchange": "NASDAQ", "cap_tier": "small", "indices": ["sp600"]},
+    {"ticker": "AWI",   "name": "Armstrong World Industries", "sector": "Industrials",   "exchange": "NYSE",   "cap_tier": "small", "indices": ["sp600"]},
+    {"ticker": "SPSC",  "name": "SPS Commerce",               "sector": "Technology",     "exchange": "NASDAQ", "cap_tier": "small", "indices": ["sp600"]},
+    {"ticker": "PI",    "name": "Impinj Inc.",                "sector": "Technology",     "exchange": "NASDAQ", "cap_tier": "small", "indices": ["sp600"]},
+    {"ticker": "PLMR",  "name": "Palomar Holdings",           "sector": "Financial Services", "exchange": "NYSE", "cap_tier": "small","indices": ["sp600"]},
+    {"ticker": "GSHD",  "name": "Goosehead Insurance",        "sector": "Financial Services", "exchange": "NASDAQ","cap_tier": "small","indices": ["sp600"]},
+    {"ticker": "CPRX",  "name": "Catalyst Pharmaceuticals",   "sector": "Healthcare",    "exchange": "NASDAQ", "cap_tier": "small", "indices": ["sp600"]},
+    {"ticker": "HRMY",  "name": "Harmony Biosciences",        "sector": "Healthcare",    "exchange": "NASDAQ", "cap_tier": "small", "indices": ["sp600"]},
+    {"ticker": "BMI",   "name": "Badger Meter Inc.",          "sector": "Technology",     "exchange": "NYSE",   "cap_tier": "small", "indices": ["sp600"]},
 ]
 
 

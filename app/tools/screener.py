@@ -45,7 +45,7 @@ MARKET_CAP_TIERS: dict[str, tuple[float, float]] = {
 
 def _resolve_cap_range(market_cap_range: str) -> tuple[float, float]:
     """Convert a cap-range label to ``(min, max)`` bounds in USD."""
-    if market_cap_range == "all":
+    if market_cap_range in ("all", "auto"):
         return (0, float("inf"))
     if market_cap_range in MARKET_CAP_TIERS:
         return MARKET_CAP_TIERS[market_cap_range]
@@ -54,8 +54,10 @@ def _resolve_cap_range(market_cap_range: str) -> tuple[float, float]:
         return (10e9, float("inf"))
     if market_cap_range == "mid_and_above":
         return (2e9, float("inf"))
-    # Default to large + mega
-    return (10e9, float("inf"))
+    if market_cap_range == "small_and_above":
+        return (300e6, float("inf"))
+    # Default: include mid-cap and above instead of excluding smaller stocks
+    return (2e9, float("inf"))
 
 
 def _cap_tiers_for_range(min_cap: float, max_cap: float) -> set[str]:
