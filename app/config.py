@@ -18,11 +18,13 @@ class Settings(BaseSettings):
 
     news_api_key: str | None = Field(default=None, description="NewsAPI.org API key (free tier, 100 requests/day) — recent headlines & sentiment")
     fred_api_key: str | None = Field(default=None, description="FRED API key (free, api.stlouisfed.org) — macroeconomic indicators")
+    fmp_api_key: str | None = Field(default=None, description="Financial Modeling Prep API key (free tier, 250 calls/day) — dynamic index constituents & screener")
 
     market_data_cache_ttl: int = 900       # 15 minutes
     fundamental_data_cache_ttl: int = 86400  # 24 hours
     sentiment_cache_ttl: int = 3600        # 1 hour
     macro_cache_ttl: int = 86400           # 24 hours
+    constituents_cache_ttl: int = 86400    # 24 hours
 
     database_url: str = "sqlite+aiosqlite:///./agentic_trader.db"
 

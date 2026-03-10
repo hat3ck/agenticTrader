@@ -1,6 +1,7 @@
 """Unit tests for market data, fundamentals, technicals, sentiment, screener tools."""
 
 import pytest
+from unittest.mock import AsyncMock, patch
 from app.tools.market_data import get_stock_price, get_historical_data, get_company_info
 from app.tools.fundamentals import get_fundamental_metrics
 from app.tools.technicals import get_technical_indicators
@@ -8,6 +9,7 @@ from app.tools.sentiment import get_news_sentiment, get_macro_environment
 from app.tools.screener import screen_stocks
 from app.tools.portfolio import kelly_fraction, optimize_portfolio
 from app.data.cache import clear_all_caches
+from app.data.constituents import get_dynamic_universe, get_universe
 
 
 @pytest.fixture(autouse=True)
@@ -107,6 +109,10 @@ async def test_screen_stocks():
     assert result["candidates_returned"] <= 10
     assert len(result["candidates"]) > 0
     assert "ticker" in result["candidates"][0]
+    # New fields from yfinance enrichment
+    candidate = result["candidates"][0]
+    assert "sector" in candidate
+    assert "exchange" in candidate
 
 
 @pytest.mark.asyncio
@@ -115,6 +121,126 @@ async def test_screen_stocks_with_exclusions():
     tickers = [c["ticker"] for c in result["candidates"]]
     assert "AAPL" not in tickers
     assert "MSFT" not in tickers
+
+
+@pytest.mark.asyncio
+async def test_screen_stocks_sector_filter():
+    result = await screen_stocks(
+        sector_preferences=["Healthcare"],
+        max_results=15,
+    )
+    assert result["candidates_returned"] > 0
+    # Preferred sector should appear in top results
+    top_sectors = [c["sector"] for c in result["candidates"][:5]]
+    assert "Healthcare" in top_sectors
+
+
+@pytest.mark.asyncio
+async def test_screen_stocks_market_cap_range():
+    result = await screen_stocks(market_cap_range="mega", max_results=10)
+    assert result["candidates_returned"] > 0
+    assert "cap_range=mega" in result["filters_applied"]
+
+
+@pytest.mark.asyncio
+async def test_screen_stocks_exchange_filter():
+    result = await screen_stocks(exchanges=["NASDAQ"], max_results=10)
+    assert result["candidates_returned"] > 0
+    for c in result["candidates"]:
+        assert c["exchange"] == "NASDAQ"
+
+
+@pytest.mark.asyncio
+async def test_screen_stocks_index_filter():
+    result = await screen_stocks(indices=["nasdaq100"], max_results=10)
+    assert result["candidates_returned"] > 0
+    assert "indices=['nasdaq100']" in result["filters_applied"]
+
+
+@pytest.mark.asyncio
+async def test_screen_stocks_conservative():
+    result = await screen_stocks(risk_tolerance="conservative", max_results=10)
+    assert result["candidates_returned"] > 0
+    # Conservative should sort by market cap descending
+    caps = [c["market_cap"] for c in result["candidates"] if c.get("market_cap")]
+    if len(caps) >= 2:
+        assert caps[0] >= caps[1], "Conservative should favour largest caps first"
+
+
+# ── Dynamic Universe (FMP + fallback) ────────────────────
+
+@pytest.mark.asyncio
+async def test_dynamic_universe_fallback():
+    """Without FMP_API_KEY, get_dynamic_universe falls back to hardcoded list."""
+    clear_all_caches()
+    universe = await get_dynamic_universe()
+    # Should return the hardcoded list (since no FMP key is set in tests)
+    assert len(universe) > 50
+    tickers = {s["ticker"] for s in universe}
+    assert "AAPL" in tickers
+    assert "MSFT" in tickers
+
+
+@pytest.mark.asyncio
+async def test_dynamic_universe_fmp_success():
+    """When FMP returns data, get_dynamic_universe uses it instead of hardcoded."""
+    clear_all_caches()
+    fake_universe = [
+        {"ticker": "AAPL", "name": "Apple Inc.", "sector": "Technology", "exchange": "NASDAQ", "cap_tier": "mega", "indices": ["sp500", "nasdaq100"]},
+        {"ticker": "MSFT", "name": "Microsoft Corp.", "sector": "Technology", "exchange": "NASDAQ", "cap_tier": "mega", "indices": ["sp500", "nasdaq100"]},
+        {"ticker": "NEWSTOCK", "name": "New Stock Co.", "sector": "Healthcare", "exchange": "NYSE", "cap_tier": "large", "indices": ["sp500"]},
+        {"ticker": "TSLA", "name": "Tesla Inc.", "sector": "Consumer Cyclical", "exchange": "NASDAQ", "cap_tier": "mega", "indices": ["sp500", "nasdaq100"]},
+    ]
+
+    with patch("app.data.constituents._fetch_fmp_universe", return_value=fake_universe):
+        universe = await get_dynamic_universe()
+
+    tickers = {s["ticker"] for s in universe}
+    assert "NEWSTOCK" in tickers  # FMP-only stock present
+    assert "TSLA" in tickers
+    # AAPL should be present
+    aapl = next(s for s in universe if s["ticker"] == "AAPL")
+    assert "sp500" in aapl["indices"]
+    assert "nasdaq100" in aapl["indices"]
+
+
+@pytest.mark.asyncio
+async def test_dynamic_universe_fmp_failure_falls_back():
+    """When FMP API fails and Wikipedia also fails, falls back to hardcoded list."""
+    clear_all_caches()
+    with patch("app.data.constituents._fetch_fmp_universe", return_value=None):
+        with patch("app.data.constituents._fetch_wikipedia_universe", return_value=None):
+            universe = await get_dynamic_universe()
+
+    # Should have fallen back to hardcoded
+    assert len(universe) > 50
+    tickers = {s["ticker"] for s in universe}
+    assert "AAPL" in tickers
+
+
+@pytest.mark.asyncio
+async def test_dynamic_universe_wikipedia_fallback():
+    """When FMP fails, Wikipedia is used as the next fallback."""
+    clear_all_caches()
+    fake_wiki_universe = [
+        {"ticker": "WIKI1", "name": "Wiki Stock 1", "sector": "Technology", "exchange": "NASDAQ", "cap_tier": "large", "indices": ["sp500"]},
+        {"ticker": "WIKI2", "name": "Wiki Stock 2", "sector": "Healthcare", "exchange": "NYSE", "cap_tier": "large", "indices": ["sp500"]},
+    ]
+
+    with patch("app.data.constituents._fetch_fmp_universe", return_value=None):
+        with patch("app.data.constituents._fetch_wikipedia_universe", return_value=fake_wiki_universe):
+            universe = await get_dynamic_universe()
+
+    tickers = {s["ticker"] for s in universe}
+    assert "WIKI1" in tickers
+    assert "WIKI2" in tickers
+
+
+def test_get_universe_sync():
+    """get_universe() always returns the hardcoded list (sync)."""
+    universe = get_universe()
+    assert len(universe) > 50
+    assert all("ticker" in s for s in universe)
 
 
 # ── Portfolio / Kelly ────────────────────────────────────

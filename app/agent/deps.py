@@ -22,3 +22,7 @@ class TraderDeps:
     selected_strategies: list[str] = field(default_factory=list)
     kelly_mode: str = "half"
     cash_reserve_pct: float = 10.0
+
+    # Dynamic recommendation range
+    min_recommendations: int = 3
+    max_recommendations: int = 6

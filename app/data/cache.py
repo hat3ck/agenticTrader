@@ -14,6 +14,7 @@ fundamental_cache: TTLCache = TTLCache(maxsize=512, ttl=settings.fundamental_dat
 sentiment_cache: TTLCache = TTLCache(maxsize=256, ttl=settings.sentiment_cache_ttl)
 macro_cache: TTLCache = TTLCache(maxsize=64, ttl=settings.macro_cache_ttl)
 screener_cache: TTLCache = TTLCache(maxsize=64, ttl=settings.market_data_cache_ttl)
+constituents_cache: TTLCache = TTLCache(maxsize=4, ttl=settings.constituents_cache_ttl)
 
 
 def get_or_set(cache: TTLCache, key: str, factory):
@@ -36,5 +37,5 @@ async def async_get_or_set(cache: TTLCache, key: str, factory):
 
 def clear_all_caches() -> None:
     """Flush every domain cache (useful in tests or manual refresh)."""
-    for c in (market_data_cache, fundamental_cache, sentiment_cache, macro_cache, screener_cache):
+    for c in (market_data_cache, fundamental_cache, sentiment_cache, macro_cache, screener_cache, constituents_cache):
         c.clear()

@@ -98,6 +98,56 @@ def get_cash_reserve_pct(
     return min(base, 25.0)
 
 
+def compute_recommendation_range(
+    funds: float,
+    horizon: InvestmentHorizon,
+    risk_tolerance: RiskTolerance = RiskTolerance.MODERATE,
+) -> tuple[int, int]:
+    """Return (min, max) number of stock recommendations.
+
+    The range adapts to:
+    - **Funds**: More capital allows broader diversification.
+    - **Horizon**: Short-term trades favour concentration; long-term
+      portfolios benefit from diversification.
+    - **Risk tolerance**: Conservative investors diversify more;
+      aggressive investors concentrate.
+    """
+    # ── Base range from available funds ─────────────────────
+    if funds < 1_000:
+        lo, hi = 1, 3
+    elif funds < 5_000:
+        lo, hi = 3, 8
+    elif funds < 25_000:
+        lo, hi = 4, 10
+    elif funds < 100_000:
+        lo, hi = 5, 12
+    else:
+        lo, hi = 8, 15
+
+    # ── Horizon adjustment ─────────────────────────────────
+    if horizon in (InvestmentHorizon.ONE_WEEK, InvestmentHorizon.ONE_MONTH):
+        # Short-term: tighter, favour fewer picks
+        hi = max(lo, hi - 2)
+    elif horizon in (InvestmentHorizon.ONE_YEAR, InvestmentHorizon.THREE_YEARS_PLUS):
+        # Long-term: allow a wider portfolio
+        lo = min(lo + 1, hi)
+        hi = hi + 2
+
+    # ── Risk tolerance adjustment ──────────────────────────
+    if risk_tolerance == RiskTolerance.CONSERVATIVE:
+        # Diversify more
+        lo = min(lo + 1, hi)
+        hi = hi + 1
+    elif risk_tolerance == RiskTolerance.AGGRESSIVE:
+        # Concentrate
+        hi = max(lo, hi - 1)
+
+    # Sanity clamps
+    lo = max(1, lo)
+    hi = max(lo, min(hi, 20))
+    return lo, hi
+
+
 def list_all_strategies() -> list[dict]:
     """Return all strategies as serialisable dicts (for GET /strategies)."""
     return [

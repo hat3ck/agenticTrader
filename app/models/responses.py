@@ -8,11 +8,16 @@ from pydantic import BaseModel, Field
 class KeyMetrics(BaseModel):
     """Subset of metrics surfaced per recommendation."""
     pe_ratio: float | None = None
+    trailing_pe: float | None = None
+    forward_pe: float | None = None
     pb_ratio: float | None = None
     peg_ratio: float | None = None
     roe: float | None = None
     debt_to_equity: float | None = None
     free_cash_flow: float | None = None
+    earnings_per_share: float | None = None
+    trailing_eps: float | None = None
+    forward_eps: float | None = None
     rsi: float | None = None
     macd_signal: str | None = None  # "bullish" / "bearish" / "neutral"
     bollinger_position: str | None = None  # "upper" / "middle" / "lower"

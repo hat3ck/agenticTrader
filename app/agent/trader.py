@@ -6,7 +6,9 @@ and `run_analyze` entry-points consumed by the FastAPI routes.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import os
 from typing import Any
 
@@ -23,6 +25,7 @@ from app.models.responses import (
     TradeRecommendationResponse,
 )
 from app.strategies.registry import (
+    compute_recommendation_range,
     get_cash_reserve_pct,
     get_kelly_mode,
     select_strategies,
@@ -33,6 +36,8 @@ from app.tools.portfolio import optimize_portfolio
 from app.tools.screener import screen_stocks
 from app.tools.sentiment import get_macro_environment, get_news_sentiment
 from app.tools.technicals import get_technical_indicators
+
+logger = logging.getLogger(__name__)
 
 _model_name = settings.llm_model
 
@@ -115,13 +120,31 @@ async def tool_screen_stocks(
     risk_tolerance: str = "moderate",
     sector_preferences: list[str] | None = None,
     excluded_tickers: list[str] | None = None,
+    market_cap_range: str = "large_and_above",
+    min_avg_daily_volume: int = 500_000,
+    exchanges: list[str] | None = None,
+    max_pe_ratio: float = 50.0,
+    indices: list[str] | None = None,
+    max_results: int = 25,
 ) -> dict:
-    """Screen stock universe to find 10-30 candidates matching criteria. Call this FIRST."""
+    """Screen the stock universe and return 10-30 filtered candidates. Call this FIRST.
+
+    Filters by market cap range (mega/large/mid/small/large_and_above/mid_and_above/all),
+    sector, exchange (NYSE/NASDAQ), minimum average daily volume (liquidity),
+    and maximum P/E ratio (exclude extreme valuations).
+    indices can be ["sp500"], ["nasdaq100"], or ["russell2000"].
+    """
     deps = ctx.deps
     return await screen_stocks(
         risk_tolerance=risk_tolerance or deps.risk_tolerance.value,
         sector_preferences=sector_preferences or deps.sector_preferences or None,
         excluded_tickers=excluded_tickers or deps.excluded_tickers or None,
+        market_cap_range=market_cap_range,
+        min_avg_daily_volume=min_avg_daily_volume,
+        exchanges=exchanges,
+        max_pe_ratio=max_pe_ratio,
+        indices=indices,
+        max_results=max_results,
     )
 
 
@@ -157,6 +180,8 @@ async def tool_get_strategy_context(ctx: RunContext[TraderDeps]) -> dict:
         "kelly_mode": deps.kelly_mode,
         "cash_reserve_pct": deps.cash_reserve_pct,
         "funds": deps.funds,
+        "min_recommendations": deps.min_recommendations,
+        "max_recommendations": deps.max_recommendations,
         "strategy_details": [
             {
                 "name": s.name,
@@ -175,6 +200,77 @@ async def tool_get_strategy_context(ctx: RunContext[TraderDeps]) -> dict:
         ],
     }
 
+async def _fetch_real_key_metrics(ticker: str) -> KeyMetrics:
+    """Fetch real key metrics for a ticker from deterministic tools.
+
+    This is called AFTER the LLM response to overwrite any hallucinated
+    metric values with actual data from yfinance / SEC EDGAR.
+    """
+    fundamentals: dict = {}
+    technicals: dict = {}
+
+    # Fetch fundamentals and technicals in parallel
+    fund_task = asyncio.create_task(_safe_fetch(get_fundamental_metrics, ticker))
+    tech_task = asyncio.create_task(_safe_fetch(get_technical_indicators, ticker))
+    fundamentals, technicals = await asyncio.gather(fund_task, tech_task)
+
+    return KeyMetrics(
+        pe_ratio=fundamentals.get("pe_ratio"),
+        trailing_pe=fundamentals.get("trailing_pe"),
+        forward_pe=fundamentals.get("forward_pe"),
+        pb_ratio=fundamentals.get("pb_ratio"),
+        peg_ratio=fundamentals.get("peg_ratio"),
+        roe=fundamentals.get("roe"),
+        debt_to_equity=fundamentals.get("debt_to_equity"),
+        free_cash_flow=fundamentals.get("free_cash_flow"),
+        earnings_per_share=fundamentals.get("earnings_per_share"),
+        trailing_eps=fundamentals.get("trailing_eps"),
+        forward_eps=fundamentals.get("forward_eps"),
+        rsi=technicals.get("rsi"),
+        macd_signal=technicals.get("macd_signal"),
+        bollinger_position=technicals.get("bollinger_position"),
+        sma_trend=technicals.get("sma_trend"),
+    )
+
+
+async def _safe_fetch(fn, ticker: str) -> dict:
+    """Call an async tool function, returning {} on failure."""
+    try:
+        return await fn(ticker)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Post-processing fetch failed for %s: %s", ticker, exc)
+        return {}
+
+
+async def _backfill_suggest_metrics(
+    response: TradeRecommendationResponse,
+) -> TradeRecommendationResponse:
+    """Replace LLM-generated key_metrics with real tool data for every recommendation."""
+    if not response.recommendations:
+        return response
+
+    # Fetch real metrics for all tickers in parallel
+    tasks = [
+        _fetch_real_key_metrics(rec.ticker)
+        for rec in response.recommendations
+    ]
+    real_metrics_list = await asyncio.gather(*tasks)
+
+    # Overwrite each recommendation's key_metrics
+    for rec, real_metrics in zip(response.recommendations, real_metrics_list):
+        rec.key_metrics = real_metrics
+
+    return response
+
+
+async def _backfill_analysis_metrics(
+    response: AnalysisResponse,
+) -> AnalysisResponse:
+    """Replace LLM-generated key_metrics with real tool data for an analysis."""
+    response.key_metrics = await _fetch_real_key_metrics(response.ticker)
+    return response
+
+
 async def run_suggest(
     funds: float,
     horizon: InvestmentHorizon,
@@ -183,6 +279,9 @@ async def run_suggest(
     excluded_tickers: list[str] | None = None,
 ) -> TradeRecommendationResponse:
     """Run the full suggestion pipeline through the PydanticAI agent."""
+    # Compute dynamic recommendation count
+    min_recs, max_recs = compute_recommendation_range(funds, horizon, risk_tolerance)
+
     # Build dependencies
     strategies = select_strategies(horizon, risk_tolerance)
     deps = TraderDeps(
@@ -194,14 +293,24 @@ async def run_suggest(
         selected_strategies=[s.name for s in strategies],
         kelly_mode=get_kelly_mode(horizon, risk_tolerance),
         cash_reserve_pct=get_cash_reserve_pct(horizon, risk_tolerance),
+        min_recommendations=min_recs,
+        max_recommendations=max_recs,
     )
 
-    # Build system prompt with strategy context
+    # Build system prompt with strategy context and dynamic sizing
     strategy_descs = [f"{s.name}: {s.description}" for s in strategies]
-    system_prompt = build_system_prompt(strategy_descs)
+    horizon_label = horizon.value.replace('_', ' ')
+    system_prompt = build_system_prompt(
+        strategy_descs,
+        min_recs=min_recs,
+        max_recs=max_recs,
+        funds=funds,
+        horizon=horizon_label,
+        risk_tolerance=risk_tolerance.value,
+    )
 
     user_prompt = (
-        f"I have ${funds:,.0f} to invest with a {horizon.value.replace('_', ' ')} horizon "
+        f"I have ${funds:,.0f} to invest with a {horizon_label} horizon "
         f"and {risk_tolerance.value} risk tolerance. "
     )
     if sector_preferences:
@@ -209,8 +318,9 @@ async def run_suggest(
     if excluded_tickers:
         user_prompt += f"Exclude these tickers: {', '.join(excluded_tickers)}. "
     user_prompt += (
-        "Please screen for candidates, analyse them, check macro conditions, "
-        "and provide specific stock recommendations with dollar allocations."
+        f"Please screen for candidates, analyse them, check macro conditions, "
+        f"and provide between {min_recs} and {max_recs} specific stock "
+        f"recommendations with dollar allocations."
     )
 
     result = await trader_agent.run(
@@ -218,7 +328,8 @@ async def run_suggest(
         deps=deps,
         instructions=system_prompt,
     )
-    return result.output
+    # Post-process: replace LLM-generated key_metrics with real tool data
+    return await _backfill_suggest_metrics(result.output)
 
 
 async def run_analyze(
@@ -243,4 +354,5 @@ async def run_analyze(
     )
 
     result = await analysis_agent.run(user_prompt, deps=deps)
-    return result.output
+    # Post-process: replace LLM-generated key_metrics with real tool data
+    return await _backfill_analysis_metrics(result.output)

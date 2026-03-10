@@ -142,7 +142,9 @@ def _extract_yf_fundamentals(t: yf.Ticker) -> dict[str, Any]:
 
     # ── Direct from .info ────────────────────────────────────────────────
     market_cap = _safe(info.get("marketCap"))
-    pe = _safe(info.get("trailingPE") or info.get("forwardPE"))
+    # Keep trailing and forward PE separate — never silently swap
+    trailing_pe = _safe(info.get("trailingPE"))
+    forward_pe = _safe(info.get("forwardPE"))
     pb = _safe(info.get("priceToBook"))
     peg = _safe(info.get("pegRatio"))
     de = _safe(info.get("debtToEquity"))
@@ -157,7 +159,9 @@ def _extract_yf_fundamentals(t: yf.Ticker) -> dict[str, Any]:
     div_yield = _safe(info.get("dividendYield"))
     if div_yield is not None:
         div_yield = round(div_yield * 100, 2)
-    eps = _safe(info.get("trailingEps") or info.get("forwardEps"))
+    # Keep trailing and forward EPS separate
+    trailing_eps = _safe(info.get("trailingEps"))
+    forward_eps = _safe(info.get("forwardEps"))
     margin = _safe(info.get("profitMargins"))
     if margin is not None:
         margin = round(margin * 100, 2)
@@ -236,7 +240,8 @@ def _extract_yf_fundamentals(t: yf.Ticker) -> dict[str, Any]:
 
     return {
         "market_cap": market_cap,
-        "pe": pe,
+        "trailing_pe": trailing_pe,
+        "forward_pe": forward_pe,
         "pb": pb,
         "peg": peg,
         "de": de,
@@ -244,7 +249,8 @@ def _extract_yf_fundamentals(t: yf.Ticker) -> dict[str, Any]:
         "roe": roe,
         "div_yield": div_yield,
         "rev_growth": rev_growth,
-        "eps": eps,
+        "trailing_eps": trailing_eps,
+        "forward_eps": forward_eps,
         "margin": margin,
         "payout": payout,
     }
@@ -271,12 +277,12 @@ async def _enrich_from_edgar(ticker: str, yf_data: dict[str, Any]) -> dict[str, 
         if latest is not None and prev is not None and prev != 0:
             data["rev_growth"] = round((latest - prev) / abs(prev) * 100, 2)
 
-    # EPS
-    if data["eps"] is None:
+    # EPS (fill trailing EPS from EDGAR if missing)
+    if data["trailing_eps"] is None:
         eps_val = _latest_fact(facts, "us-gaap", "EarningsPerShareDiluted")
         if eps_val is None:
             eps_val = _latest_fact(facts, "us-gaap", "EarningsPerShareBasic")
-        data["eps"] = _safe_round(eps_val)
+        data["trailing_eps"] = _safe_round(eps_val)
 
     # Net income for ROE / margin
     net_income = _latest_fact(facts, "us-gaap", "NetIncomeLoss")
@@ -349,25 +355,34 @@ async def get_fundamental_metrics(ticker: str) -> dict:
         except Exception as exc:  # noqa: BLE001
             logger.warning("yfinance fundamentals failed for %s: %s — trying SEC EDGAR only", ticker, exc)
             yf_data = {
-                "market_cap": None, "pe": None, "pb": None, "peg": None,
+                "market_cap": None, "trailing_pe": None, "forward_pe": None,
+                "pb": None, "peg": None,
                 "de": None, "fcf": None, "roe": None, "div_yield": None,
-                "rev_growth": None, "eps": None, "margin": None, "payout": None,
+                "rev_growth": None, "trailing_eps": None, "forward_eps": None,
+                "margin": None, "payout": None,
             }
 
         # Enrich missing fields from SEC EDGAR
         data = await _enrich_from_edgar(ticker, yf_data)
 
-        pe = _safe_round(data["pe"], 2)
+        trailing_pe = _safe_round(data["trailing_pe"], 2)
+        forward_pe = _safe_round(data["forward_pe"], 2)
+        # Use trailing PE as primary; only fall back to forward if trailing is unavailable
+        pe_display = trailing_pe if trailing_pe is not None else forward_pe
         peg = _safe_round(data["peg"], 2)
         pb = _safe_round(data["pb"], 2)
         de = _safe_round(data["de"], 2)
         fcf = _safe_round(data["fcf"], 0)
         roe = _safe_round(data["roe"], 2)
+        trailing_eps = _safe_round(data["trailing_eps"], 2)
+        forward_eps = _safe_round(data["forward_eps"], 2)
 
         return {
             "ticker": ticker.upper(),
             "market_cap": _safe_round(data["market_cap"], 0),
-            "pe_ratio": pe,
+            "pe_ratio": pe_display,
+            "trailing_pe": trailing_pe,
+            "forward_pe": forward_pe,
             "pb_ratio": pb,
             "peg_ratio": peg,
             "debt_to_equity": de,
@@ -375,10 +390,12 @@ async def get_fundamental_metrics(ticker: str) -> dict:
             "roe": roe,
             "dividend_yield": _safe_round(data["div_yield"], 2),
             "revenue_growth": _safe_round(data["rev_growth"], 2),
-            "earnings_per_share": _safe_round(data["eps"], 2),
+            "earnings_per_share": trailing_eps,
+            "trailing_eps": trailing_eps,
+            "forward_eps": forward_eps,
             "profit_margin": _safe_round(data["margin"], 2),
             "payout_ratio": _safe_round(data["payout"], 2),
-            "valuation_summary": _valuation_summary(pe, peg, pb),
+            "valuation_summary": _valuation_summary(pe_display, peg, pb),
             "health_summary": _health_summary(de, fcf),
             "quality_summary": _quality_summary(roe, data.get("rev_growth"), data.get("div_yield")),
         }

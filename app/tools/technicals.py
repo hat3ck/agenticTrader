@@ -1,45 +1,40 @@
 """Technical Analysis Tool — RSI, MACD, Bollinger, SMA/EMA, ATR, Volume.
 
-Uses pandas-ta for indicator computation on mock OHLCV DataFrames.
-When yfinance is integrated, this module will consume real DataFrames.
+Uses pandas-ta for indicator computation on real OHLCV data from yfinance.
 """
 
 from __future__ import annotations
 
-import random
-import datetime as dt
+import asyncio
+import logging
 
 import numpy as np
 import pandas as pd
 import pandas_ta as ta  # type: ignore
+import yfinance as yf
 
 from app.data.cache import market_data_cache, async_get_or_set
 
+logger = logging.getLogger(__name__)
 
-def _generate_mock_ohlcv(ticker: str, days: int = 252) -> pd.DataFrame:
-    """Generate a realistic-looking OHLCV DataFrame for testing."""
-    np.random.seed(hash(ticker) % 2**31)
-    dates = pd.bdate_range(end=dt.date.today(), periods=days)
-    n = len(dates)  # actual count — may differ from `days` on weekends/holidays
-    base_price = {"AAPL": 185, "MSFT": 420, "NVDA": 890, "GOOGL": 175, "AMZN": 195}.get(
-        ticker.upper(), random.randint(50, 400)
-    )
-    # Geometric Brownian Motion
-    returns = np.random.normal(0.0005, 0.02, n)
-    prices = base_price * np.cumprod(1 + returns)
 
-    df = pd.DataFrame(
-        {
-            "Open": prices * (1 + np.random.uniform(-0.005, 0.005, n)),
-            "High": prices * (1 + np.random.uniform(0.001, 0.025, n)),
-            "Low": prices * (1 - np.random.uniform(0.001, 0.025, n)),
-            "Close": prices,
-            "Volume": np.random.randint(5_000_000, 80_000_000, n),
-        },
-        index=dates,
-    )
-    df.index.name = "Date"
-    return df.round(2)
+async def _fetch_real_ohlcv(ticker: str, period: str = "1y") -> pd.DataFrame:
+    """Fetch real OHLCV data from yfinance for technical analysis.
+
+    Returns a DataFrame with columns: Open, High, Low, Close, Volume.
+    Falls back to a shorter period if data is insufficient.
+    """
+    t = yf.Ticker(ticker.upper())
+    df = await asyncio.to_thread(lambda: t.history(period=period, auto_adjust=True))
+    if df.empty:
+        raise ValueError(f"No OHLCV data returned by yfinance for {ticker}")
+    # Ensure standard column names
+    df = df.rename(columns={c: c.title() for c in df.columns})
+    # Keep only the columns we need
+    for col in ("Open", "High", "Low", "Close", "Volume"):
+        if col not in df.columns:
+            raise ValueError(f"Missing '{col}' column in yfinance data for {ticker}")
+    return df[["Open", "High", "Low", "Close", "Volume"]]
 
 
 def _compute_indicators(df: pd.DataFrame) -> dict:
@@ -161,7 +156,14 @@ async def get_technical_indicators(ticker: str) -> dict:
     """
 
     async def _fetch():
-        df = _generate_mock_ohlcv(ticker)
+        try:
+            df = await _fetch_real_ohlcv(ticker, period="1y")
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to fetch real OHLCV for %s: %s", ticker, exc)
+            raise RuntimeError(
+                f"Could not fetch OHLCV data for {ticker}. "
+                "Technical analysis requires real market data."
+            ) from exc
         indicators = _compute_indicators(df)
         indicators["ticker"] = ticker.upper()
         return indicators
