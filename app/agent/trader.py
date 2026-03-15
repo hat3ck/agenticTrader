@@ -162,6 +162,7 @@ async def tool_screen_stocks(
         max_pe_ratio=max_pe_ratio,
         indices=indices,
         max_results=max_results,
+        data_source=deps.data_source,
     )
 
 
@@ -304,6 +305,7 @@ async def run_suggest(
     risk_tolerance: RiskTolerance,
     sector_preferences: list[str] | None = None,
     excluded_tickers: list[str] | None = None,
+    data_source: str = "auto",
 ) -> TradeRecommendationResponse:
     """Run the full suggestion pipeline through the PydanticAI agent."""
     # Compute dynamic recommendation count
@@ -320,6 +322,7 @@ async def run_suggest(
         selected_strategies=[s.name for s in strategies],
         kelly_mode=get_kelly_mode(horizon, risk_tolerance),
         cash_reserve_pct=get_cash_reserve_pct(horizon, risk_tolerance),
+        data_source=data_source,
         min_recommendations=min_recs,
         max_recommendations=max_recs,
     )

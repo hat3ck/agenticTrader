@@ -196,6 +196,7 @@ async def screen_stocks(
     max_pe_ratio: float = 50.0,
     indices: list[str] | None = None,
     max_results: int = 25,
+    data_source: str = "auto",
 ) -> dict:
     """Screen the stock universe and return a filtered list of candidates.
 
@@ -247,13 +248,13 @@ async def screen_stocks(
         cap_tiers = _cap_tiers_for_range(min_cap, max_cap)
 
         # ── 2. Static pre-filter (instant) ───────────────────────────────
-        universe = await get_dynamic_universe()
+        universe = await get_dynamic_universe(data_source=data_source)
         total_screened = len(universe)
 
         # Dynamic sources (FMP/Wikipedia) use placeholder cap_tiers, so skip
         # cap-tier prefiltering — the yfinance enrichment phase will apply the
         # actual market-cap filter from live data instead.
-        source = get_universe_source_sync()
+        source = get_universe_source_sync(data_source=data_source)
         pre_cap_tiers = cap_tiers if source == "hardcoded" else set()
 
         prefiltered = _static_prefilter(

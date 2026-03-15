@@ -22,6 +22,14 @@ class RiskTolerance(str, Enum):
     AGGRESSIVE = "aggressive"
 
 
+class DataSource(str, Enum):
+    """Data source for stock universe constituents."""
+    AUTO = "auto"            # Default fallback chain: FMP → Wikipedia → Hardcoded
+    FMP = "fmp"              # FMP API only (requires FMP_API_KEY)
+    WIKIPEDIA = "wikipedia"  # Wikipedia scraping only
+    HARDCODED = "hardcoded"  # Built-in static universe
+
+
 class SuggestRequest(BaseModel):
     """POST /api/v1/suggest — main recommendation request."""
     funds: float = Field(..., gt=0, description="Available capital in USD")
@@ -29,6 +37,7 @@ class SuggestRequest(BaseModel):
     risk_tolerance: RiskTolerance = Field(default=RiskTolerance.MODERATE)
     sector_preferences: list[str] | None = Field(default=None, description="Optional sector preferences")
     excluded_tickers: list[str] | None = Field(default=None, description="Tickers to exclude")
+    data_source: DataSource = Field(default=DataSource.AUTO, description="Data source for the stock universe (auto, fmp, wikipedia, hardcoded)")
 
 
 class AnalyzeRequest(BaseModel):

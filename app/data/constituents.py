@@ -625,34 +625,58 @@ _KNOWN_NASDAQ: set[str] = {
 }
 
 
-async def get_dynamic_universe() -> list[StockEntry]:
-    """Return the stock universe, preferring live data over the hardcoded list.
+async def get_dynamic_universe(data_source: str = "auto") -> list[StockEntry]:
+    """Return the stock universe using the specified data source.
 
-    Fallback chain: FMP API → Wikipedia → hardcoded.
+    Args:
+        data_source: Which source to fetch from.
+            ``"auto"``      – Fallback chain: FMP → Wikipedia → hardcoded (default).
+            ``"fmp"``       – FMP API only; falls back to hardcoded on failure.
+            ``"wikipedia"`` – Wikipedia only; falls back to hardcoded on failure.
+            ``"hardcoded"`` – Built-in static universe (no network calls).
     """
+    # Use a source-specific cache key so different sources don't collide
+    cache_key = f"universe:{data_source}"
 
     async def _fetch():
-        # 1. Try FMP (requires API key)
+        if data_source == "fmp":
+            fmp = await _fetch_fmp_universe()
+            if fmp is not None:
+                return {"source": "fmp", "stocks": fmp}
+            logger.warning("FMP source requested but failed; falling back to hardcoded")
+            return {"source": "hardcoded", "stocks": list(_UNIVERSE)}
+
+        if data_source == "wikipedia":
+            wiki = await _fetch_wikipedia_universe()
+            if wiki is not None:
+                return {"source": "wikipedia", "stocks": wiki}
+            logger.warning("Wikipedia source requested but failed; falling back to hardcoded")
+            return {"source": "hardcoded", "stocks": list(_UNIVERSE)}
+
+        if data_source == "hardcoded":
+            logger.info("Using hardcoded stock universe (%d stocks)", len(_UNIVERSE))
+            return {"source": "hardcoded", "stocks": list(_UNIVERSE)}
+
+        # Default: "auto" — original fallback chain
         fmp = await _fetch_fmp_universe()
         if fmp is not None:
             return {"source": "fmp", "stocks": fmp}
 
-        # 2. Try Wikipedia (free, no key needed)
         wiki = await _fetch_wikipedia_universe()
         if wiki is not None:
             return {"source": "wikipedia", "stocks": wiki}
 
-        # 3. Hardcoded fallback
         logger.info("Using hardcoded stock universe (%d stocks)", len(_UNIVERSE))
         return {"source": "hardcoded", "stocks": list(_UNIVERSE)}
 
-    cached = await async_get_or_set(constituents_cache, "universe", _fetch)
+    cached = await async_get_or_set(constituents_cache, cache_key, _fetch)
     return cached["stocks"]
 
 
-def get_universe_source_sync() -> str:
-    """Check if the cached universe came from FMP or hardcoded (for diagnostics)."""
-    cached = constituents_cache.get("universe")
+def get_universe_source_sync(data_source: str = "auto") -> str:
+    """Check which source the cached universe came from (for diagnostics)."""
+    cache_key = f"universe:{data_source}"
+    cached = constituents_cache.get(cache_key)
     if cached:
         return cached["source"]
     return "not_loaded"

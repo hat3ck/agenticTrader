@@ -23,6 +23,9 @@ class TraderDeps:
     kelly_mode: str = "half"
     cash_reserve_pct: float = 10.0
 
+    # Data source preference
+    data_source: str = "auto"
+
     # Dynamic recommendation range
     min_recommendations: int = 3
     max_recommendations: int = 6
