@@ -116,13 +116,13 @@ def compute_recommendation_range(
     if funds < 1_000:
         lo, hi = 1, 3
     elif funds < 5_000:
-        lo, hi = 3, 8
+        lo, hi = 3, 5
     elif funds < 25_000:
-        lo, hi = 4, 10
+        lo, hi = 4, 6
     elif funds < 100_000:
-        lo, hi = 5, 12
+        lo, hi = 5, 9
     else:
-        lo, hi = 8, 15
+        lo, hi = 6, 10
 
     # ── Horizon adjustment ─────────────────────────────────
     if horizon in (InvestmentHorizon.ONE_WEEK, InvestmentHorizon.ONE_MONTH):
