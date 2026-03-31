@@ -73,6 +73,7 @@ async def suggest(req: SuggestRequest):
         risk_tolerance=req.risk_tolerance,
         sector_preferences=req.sector_preferences,
         excluded_tickers=req.excluded_tickers,
+        dividend_investing=req.dividend_investing,
         data_source=req.data_source.value,
     )
 
@@ -173,6 +174,7 @@ async def ws_suggest(ws: WebSocket):
             risk_tolerance=req.risk_tolerance,
             sector_preferences=req.sector_preferences,
             excluded_tickers=req.excluded_tickers,
+            dividend_investing=req.dividend_investing,
             data_source=req.data_source.value,
         )
 

@@ -305,6 +305,7 @@ async def run_suggest(
     risk_tolerance: RiskTolerance,
     sector_preferences: list[str] | None = None,
     excluded_tickers: list[str] | None = None,
+    dividend_investing: bool = True,
     data_source: str = "auto",
 ) -> TradeRecommendationResponse:
     """Run the full suggestion pipeline through the PydanticAI agent."""
@@ -312,7 +313,7 @@ async def run_suggest(
     min_recs, max_recs = compute_recommendation_range(funds, horizon, risk_tolerance)
 
     # Build dependencies
-    strategies = select_strategies(horizon, risk_tolerance)
+    strategies = select_strategies(horizon, risk_tolerance, dividend_investing=dividend_investing)
     deps = TraderDeps(
         funds=funds,
         horizon=horizon,
@@ -323,6 +324,7 @@ async def run_suggest(
         kelly_mode=get_kelly_mode(horizon, risk_tolerance),
         cash_reserve_pct=get_cash_reserve_pct(horizon, risk_tolerance),
         data_source=data_source,
+        dividend_investing=dividend_investing,
         min_recommendations=min_recs,
         max_recommendations=max_recs,
     )
@@ -337,6 +339,7 @@ async def run_suggest(
         funds=funds,
         horizon=horizon_label,
         risk_tolerance=risk_tolerance.value,
+        dividend_investing=dividend_investing,
     )
 
     user_prompt = (
@@ -347,6 +350,12 @@ async def run_suggest(
         user_prompt += f"I prefer these sectors: {', '.join(sector_preferences)}. "
     if excluded_tickers:
         user_prompt += f"Exclude these tickers: {', '.join(excluded_tickers)}. "
+    if not dividend_investing:
+        user_prompt += (
+            "I do NOT want dividend-focused stocks. Avoid recommending stocks "
+            "primarily because of their dividend yield. Prefer high-growth "
+            "companies over dividend payers. "
+        )
     user_prompt += (
         f"Please screen for candidates, analyse them, check macro conditions, "
         f"and provide between {min_recs} and {max_recs} specific stock "

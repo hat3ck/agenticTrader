@@ -26,6 +26,9 @@ class TraderDeps:
     # Data source preference
     data_source: str = "auto"
 
+    # Dividend investing preference
+    dividend_investing: bool = True
+
     # Dynamic recommendation range
     min_recommendations: int = 3
     max_recommendations: int = 6

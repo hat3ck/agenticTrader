@@ -31,6 +31,34 @@ def test_quality_always_included():
         assert "Quality Factor" in names
 
 
+def test_dividend_investing_disabled_excludes_dividend():
+    """When dividend_investing=False, Dividend Income strategy is excluded."""
+    strategies = select_strategies(
+        InvestmentHorizon.ONE_YEAR, RiskTolerance.MODERATE, dividend_investing=False,
+    )
+    names = [s.name for s in strategies]
+    assert "Dividend Income" not in names
+
+
+def test_dividend_investing_enabled_includes_dividend():
+    """When dividend_investing=True, Dividend Income strategy is included for long horizons."""
+    strategies = select_strategies(
+        InvestmentHorizon.ONE_YEAR, RiskTolerance.MODERATE, dividend_investing=True,
+    )
+    names = [s.name for s in strategies]
+    assert "Dividend Income" in names
+
+
+def test_dividend_investing_disabled_ensures_growth():
+    """When dividend_investing=False, Growth Investing is guaranteed to be present."""
+    strategies = select_strategies(
+        InvestmentHorizon.THREE_YEARS_PLUS, RiskTolerance.CONSERVATIVE, dividend_investing=False,
+    )
+    names = [s.name for s in strategies]
+    assert "Growth Investing" in names
+    assert "Dividend Income" not in names
+
+
 def test_conservative_risk_adjusts():
     strategies = select_strategies(InvestmentHorizon.THREE_MONTHS, RiskTolerance.CONSERVATIVE)
     # Quality Factor should be present for conservative

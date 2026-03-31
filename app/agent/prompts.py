@@ -111,6 +111,7 @@ def build_system_prompt(
     funds: float = 10_000.0,
     horizon: str = "3 months",
     risk_tolerance: str = "moderate",
+    dividend_investing: bool = True,
 ) -> str:
     """Build the system prompt with dynamic recommendation-count guidance."""
     strategies_block = "\n".join(f"- {s}" for s in strategy_descriptions)
@@ -162,4 +163,24 @@ def build_system_prompt(
             "balance between growth potential and stability.\n"
         )
 
-    return prompt + sizing_block + cap_block
+    # ── Dividend investing guidance ────────────────────────────────
+    if not dividend_investing:
+        dividend_block = (
+            "\n## Dividend investing: DISABLED\n\n"
+            "The user has explicitly opted out of dividend-focused investing. "
+            "You MUST follow these rules:\n"
+            "- Do NOT recommend stocks primarily because they pay dividends.\n"
+            "- Avoid classic dividend aristocrats and high-yield income stocks "
+            "unless they also have strong growth characteristics.\n"
+            "- Prefer companies that reinvest earnings into growth (R&D, "
+            "expansion) over those that return capital via dividends.\n"
+            "- When evaluating candidates, deprioritise dividend yield as a "
+            "positive factor. A stock paying no dividend or a low dividend is "
+            "perfectly acceptable.\n"
+            "- Focus on revenue growth, earnings acceleration, and capital "
+            "appreciation potential instead.\n"
+        )
+    else:
+        dividend_block = ""
+
+    return prompt + sizing_block + cap_block + dividend_block

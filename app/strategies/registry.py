@@ -40,6 +40,7 @@ _RISK_ADJUSTMENTS: dict[RiskTolerance, list[str]] = {
 def select_strategies(
     horizon: InvestmentHorizon,
     risk_tolerance: RiskTolerance = RiskTolerance.MODERATE,
+    dividend_investing: bool = True,
 ) -> list[TradingStrategy]:
     """Return ordered list of applicable strategies.
 
@@ -59,6 +60,13 @@ def select_strategies(
     # Always add Quality Factor as a secondary overlay if not already present
     if QUALITY_FACTOR not in primary:
         primary.append(QUALITY_FACTOR)
+
+    # Filter out Dividend Income strategy when dividend investing is disabled
+    if not dividend_investing:
+        primary = [s for s in primary if s is not DIVIDEND_INCOME]
+        # Ensure at least one growth-oriented strategy is included
+        if GROWTH_INVESTING not in primary:
+            primary.insert(0, GROWTH_INVESTING)
 
     return primary
 

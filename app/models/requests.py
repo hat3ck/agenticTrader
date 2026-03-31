@@ -37,6 +37,7 @@ class SuggestRequest(BaseModel):
     risk_tolerance: RiskTolerance = Field(default=RiskTolerance.MODERATE)
     sector_preferences: list[str] | None = Field(default=None, description="Optional sector preferences")
     excluded_tickers: list[str] | None = Field(default=None, description="Tickers to exclude")
+    dividend_investing: bool = Field(default=True, description="Include dividend-focused stocks in recommendations. Set to false to prefer growth stocks over dividend payers.")
     data_source: DataSource = Field(default=DataSource.AUTO, description="Data source for the stock universe (auto, fmp, wikipedia, hardcoded)")
 
 
