@@ -128,20 +128,42 @@ pytest -v
 Edit `.env`:
 
 ```bash
-# Local (LM Studio)
-LLM_MODEL=openai:gemma-3
+# Local LM Studio (must use "openai:" prefix for OpenAI-compatible APIs)
+LLM_MODEL=openai:google/gemma-3-27b
 LLM_BASE_URL=http://localhost:1234/v1
+OPENAI_API_KEY=lm-studio
 
 # OpenAI
-LLM_MODEL=openai:gpt-4o
-OPENAI_API_KEY=sk-...
+# LLM_MODEL=openai:gpt-4o
+# OPENAI_API_KEY=sk-...
 
 # Anthropic
-LLM_MODEL=anthropic:claude-sonnet-4-20250514
-ANTHROPIC_API_KEY=sk-ant-...
+# LLM_MODEL=anthropic:claude-sonnet-4-20250514
+# ANTHROPIC_API_KEY=sk-ant-...
 ```
 
 Zero code changes required.
+
+## Environment Variables
+
+Full `.env` reference:
+
+```bash
+# App settings
+APP_ENV=development
+LOG_LEVEL=INFO
+
+# Cache TTLs (seconds)
+MARKET_DATA_CACHE_TTL=900
+FUNDAMENTAL_DATA_CACHE_TTL=86400
+SENTIMENT_CACHE_TTL=3600
+MACRO_CACHE_TTL=86400
+
+# Sentiment & Macro APIs
+NEWS_API_KEY=your-newsapi-key        # https://newsapi.org (free, 100 req/day)
+FRED_API_KEY=your-fred-api-key       # https://fred.stlouisfed.org/docs/api/api_key.html (free)
+FMP_API_KEY=your-fmp-api-key         # https://financialmodelingprep.com/developer/docs/pricing/ (free tier, 250 calls/day)
+```
 
 ## License
 
