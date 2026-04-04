@@ -5,15 +5,12 @@ Data sources:
   • FRED API  (Federal Reserve Economic Data, free) — macroeconomic indicators:
     interest rates (Fed Funds Rate), inflation (CPI), GDP growth, unemployment,
     yield-curve spread
-
-Falls back to mock data when API keys are not configured.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import random
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -311,89 +308,6 @@ def _infer_market_regime(
     return "slow_growth"
 
 
-# ── Mock fallbacks (used when API keys are not set) ──────────────────────────
-
-def _mock_news_sentiment(ticker: str) -> dict:
-    """Return mock sentiment data — used when NEWS_API_KEY is not configured."""
-    mock_data = {
-        "AAPL": {"score": 0.6, "headlines": [
-            {"title": "Apple Vision Pro sales exceed expectations", "sentiment": "positive", "source": "Reuters", "description": "", "published_at": "", "url": "", "sentiment_score": 0.6},
-            {"title": "Apple AI strategy gains traction with developers", "sentiment": "positive", "source": "Bloomberg", "description": "", "published_at": "", "url": "", "sentiment_score": 0.5},
-            {"title": "iPhone sales face headwinds in China", "sentiment": "negative", "source": "CNBC", "description": "", "published_at": "", "url": "", "sentiment_score": -0.4},
-        ]},
-        "NVDA": {"score": 0.8, "headlines": [
-            {"title": "NVIDIA reports record AI chip demand", "sentiment": "positive", "source": "Reuters", "description": "", "published_at": "", "url": "", "sentiment_score": 0.7},
-            {"title": "Data center revenue surges 200% YoY", "sentiment": "positive", "source": "Bloomberg", "description": "", "published_at": "", "url": "", "sentiment_score": 0.8},
-            {"title": "NVIDIA valuation concerns grow among analysts", "sentiment": "negative", "source": "WSJ", "description": "", "published_at": "", "url": "", "sentiment_score": -0.3},
-        ]},
-        "MSFT": {"score": 0.5, "headlines": [
-            {"title": "Microsoft Azure AI services drive cloud growth", "sentiment": "positive", "source": "CNBC", "description": "", "published_at": "", "url": "", "sentiment_score": 0.5},
-            {"title": "Copilot adoption accelerates across enterprise", "sentiment": "positive", "source": "Reuters", "description": "", "published_at": "", "url": "", "sentiment_score": 0.4},
-            {"title": "Antitrust scrutiny on Microsoft-OpenAI deal", "sentiment": "negative", "source": "FT", "description": "", "published_at": "", "url": "", "sentiment_score": -0.3},
-        ]},
-    }
-
-    if ticker.upper() in mock_data:
-        data = mock_data[ticker.upper()]
-    else:
-        score = round(random.uniform(-0.5, 0.8), 2)
-        data = {
-            "score": score,
-            "headlines": [
-                {"title": f"{ticker.upper()} reports quarterly earnings", "sentiment": "neutral", "source": "Reuters", "description": "", "published_at": "", "url": "", "sentiment_score": 0.0},
-                {"title": f"Analysts upgrade {ticker.upper()} price target", "sentiment": "positive", "source": "Bloomberg", "description": "", "published_at": "", "url": "", "sentiment_score": 0.3},
-            ],
-        }
-
-    score = data["score"]
-    sentiment_label = "positive" if score > 0.2 else "negative" if score < -0.2 else "neutral"
-
-    return {
-        "ticker": ticker.upper(),
-        "data_source": "mock",
-        "overall_sentiment": sentiment_label,
-        "sentiment_score": score,
-        "headlines": data["headlines"],
-        "summary": (
-            f"[MOCK DATA] Overall sentiment for {ticker.upper()} is {sentiment_label} "
-            f"(score: {score}). Set NEWS_API_KEY for live data."
-        ),
-    }
-
-
-def _mock_macro_environment() -> dict:
-    """Return mock macro data — used when FRED_API_KEY is not configured."""
-    return {
-        "data_source": "mock",
-        "fed_rate": 5.25,
-        "fed_direction": "holding",
-        "inflation_rate": 3.1,
-        "inflation_trend": "falling",
-        "yield_curve": "flat",
-        "gdp_growth": 2.5,
-        "unemployment": 3.8,
-        "treasury_10y": 4.25,
-        "treasury_2y": 4.60,
-        "treasury_3mo": 5.20,
-        "yield_spread_10y_2y": -0.35,
-        "market_regime": "moderate_bull",
-        "sector_signals": {
-            "Technology": "neutral",
-            "Healthcare": "tailwind",
-            "Financial Services": "tailwind",
-            "Energy": "neutral",
-            "Consumer Cyclical": "headwind",
-            "Consumer Defensive": "tailwind",
-            "Utilities": "tailwind",
-            "Real Estate": "headwind",
-        },
-        "summary": (
-            "[MOCK DATA] The Fed is holding rates at 5.25% with inflation trending down "
-            "to 3.1%. Set FRED_API_KEY for live data."
-        ),
-    }
-
-
 # ── Public API ───────────────────────────────────────────────────────────────
 
 async def get_news_sentiment(ticker: str) -> dict:
@@ -401,7 +315,7 @@ async def get_news_sentiment(ticker: str) -> dict:
 
     Returns a dict with:
     - ticker: The stock symbol
-    - data_source: 'newsapi' or 'mock'
+    - data_source: 'newsapi'
     - overall_sentiment: 'positive', 'negative', or 'neutral'
     - sentiment_score: Float from -1 (very negative) to +1 (very positive)
     - headlines: List of recent headline dicts with title, sentiment, source, date
@@ -417,12 +331,23 @@ async def get_news_sentiment(ticker: str) -> dict:
         headlines = await _fetch_news_headlines(ticker)
 
         if headlines is None:
-            # API key not set or request failed — use mock
-            logger.info(
-                "Using mock sentiment data for %s (NEWS_API_KEY not set or request failed)",
+            # API key not set or request failed
+            logger.warning(
+                "Cannot fetch sentiment for %s (NEWS_API_KEY not set or request failed)",
                 ticker,
             )
-            return _mock_news_sentiment(ticker)
+            return {
+                "ticker": ticker.upper(),
+                "data_source": "unavailable",
+                "overall_sentiment": "unknown",
+                "sentiment_score": 0.0,
+                "headlines": [],
+                "error": "NEWS_API_KEY is not configured or the request failed.",
+                "summary": (
+                    f"Sentiment data unavailable for {ticker.upper()}. "
+                    "Configure NEWS_API_KEY to enable live news sentiment."
+                ),
+            }
 
         if not headlines:
             # API returned no results
@@ -464,7 +389,7 @@ async def get_macro_environment() -> dict:
     """Get current macroeconomic environment snapshot.
 
     Returns a dict with:
-    - data_source: 'fred' or 'mock'
+    - data_source: 'fred'
     - fed_rate: Current federal funds rate (percentage)
     - fed_direction: 'hiking', 'holding', or 'cutting'
     - inflation_rate: Current CPI inflation (percentage, year-over-year approx)
@@ -488,8 +413,12 @@ async def get_macro_environment() -> dict:
 
     async def _fetch():
         if not settings.fred_api_key:
-            logger.info("Using mock macro data (FRED_API_KEY not set)")
-            return _mock_macro_environment()
+            logger.warning("FRED_API_KEY is not configured — macro data unavailable")
+            return {
+                "data_source": "unavailable",
+                "error": "FRED_API_KEY is not configured.",
+                "summary": "Macro environment data unavailable. Configure FRED_API_KEY to enable live macro data.",
+            }
 
         # Fetch all FRED series in parallel
         gathered = await asyncio.gather(
@@ -567,10 +496,14 @@ async def get_macro_environment() -> dict:
 
         summary = " ".join(parts) if parts else "Macro data partially unavailable."
 
-        # If all key values are None, something went wrong — fall back to mock
+        # If all key values are None, something went wrong
         if all(v is None for v in [fed_rate, inflation_rate, gdp_growth, unemployment]):
-            logger.warning("All FRED series returned None — falling back to mock data")
-            return _mock_macro_environment()
+            logger.warning("All FRED series returned None — macro data unavailable")
+            return {
+                "data_source": "fred",
+                "error": "All FRED series returned no data.",
+                "summary": "Macro environment data unavailable — all FRED API requests returned no data.",
+            }
 
         return {
             "data_source": "fred",

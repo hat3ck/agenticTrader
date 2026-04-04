@@ -122,7 +122,7 @@ def compute_recommendation_range(
     """
     # ── Base range from available funds ─────────────────────
     if funds < 1_000:
-        lo, hi = 1, 3
+        lo, hi = 1, 2
     elif funds < 5_000:
         lo, hi = 3, 5
     elif funds < 25_000:
