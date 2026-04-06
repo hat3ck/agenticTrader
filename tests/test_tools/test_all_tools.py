@@ -143,6 +143,191 @@ async def test_screen_stocks_market_cap_range():
 
 
 @pytest.mark.asyncio
+async def test_screen_stocks_market_cap_min_override():
+    """Market cap min override filters out companies below the threshold."""
+    result = await screen_stocks(
+        market_cap_range="all",
+        market_cap_min_override=100e9,  # $100B minimum
+        max_results=10,
+    )
+    assert result["candidates_returned"] > 0
+    for c in result["candidates"]:
+        if c.get("market_cap") is not None:
+            assert c["market_cap"] >= 100e9, (
+                f"{c['ticker']} market_cap {c['market_cap']:.0f} < 100B"
+            )
+
+
+@pytest.mark.asyncio
+async def test_screen_stocks_market_cap_max_override():
+    """Market cap max override filters out companies above the threshold."""
+    result = await screen_stocks(
+        market_cap_range="all",
+        market_cap_max_override=50e9,  # $50B maximum
+        max_results=10,
+    )
+    assert result["candidates_returned"] > 0
+    for c in result["candidates"]:
+        if c.get("market_cap") is not None:
+            assert c["market_cap"] <= 50e9, (
+                f"{c['ticker']} market_cap {c['market_cap']:.0f} > 50B"
+            )
+
+
+@pytest.mark.asyncio
+async def test_screen_stocks_market_cap_min_max_override():
+    """Both min and max overrides constrain the market cap range."""
+    result = await screen_stocks(
+        market_cap_range="all",
+        market_cap_min_override=10e9,   # $10B minimum
+        market_cap_max_override=200e9,  # $200B maximum
+        max_results=10,
+    )
+    assert result["candidates_returned"] > 0
+    for c in result["candidates"]:
+        if c.get("market_cap") is not None:
+            assert c["market_cap"] >= 10e9, (
+                f"{c['ticker']} market_cap {c['market_cap']:.0f} < 10B"
+            )
+            assert c["market_cap"] <= 200e9, (
+                f"{c['ticker']} market_cap {c['market_cap']:.0f} > 200B"
+            )
+
+
+@pytest.mark.asyncio
+async def test_screen_stocks_override_beats_risk_based_range():
+    """User overrides must replace (not narrow) the risk-based cap range.
+
+    Regression: with market_cap_range="large_and_above" (min=10B) and a user
+    override max=1B, the old ``max()``/``min()`` logic produced min=10B, max=1B
+    — an impossible range that returned zero candidates.
+    """
+    clear_all_caches()
+    fake_yf_stocks = [
+        {"ticker": "SMLL", "name": "Small Co", "sector": "Technology",
+         "exchange": "NASDAQ", "cap_tier": "small", "indices": [],
+         "market_cap": 500e6, "price": 25.0, "pe_ratio": 15.0,
+         "avg_daily_volume": 600_000},
+    ]
+
+    def mock_batch_volume(tickers):
+        return {t: 600_000 for t in tickers}
+
+    with patch("app.tools.screener.get_dynamic_universe", new_callable=AsyncMock, return_value=[]):
+        with patch("app.tools.screener.get_universe_source_sync", return_value="hardcoded"):
+            with patch("app.tools.screener._yf_screen_by_market_cap", new_callable=AsyncMock, return_value=fake_yf_stocks):
+                with patch("app.tools.screener._batch_download_volume", side_effect=mock_batch_volume):
+                    result = await screen_stocks(
+                        market_cap_range="large_and_above",  # floor=10B
+                        market_cap_min_override=0,
+                        market_cap_max_override=1e9,         # ceiling=1B  (below floor!)
+                        max_results=10,
+                    )
+
+    assert result["candidates_returned"] > 0, (
+        "Overrides should replace risk-based bounds, not narrow them"
+    )
+    tickers = [c["ticker"] for c in result["candidates"]]
+    assert "SMLL" in tickers
+
+
+@pytest.mark.asyncio
+async def test_screen_stocks_yf_screener_supplement():
+    """When yfinance screener returns stocks for a custom cap range, they appear as candidates."""
+    clear_all_caches()
+    # Small base universe so fake screener stocks aren't truncated by _BATCH_LIMIT
+    small_universe = [
+        {"ticker": "AAPL", "name": "Apple Inc.", "sector": "Technology",
+         "exchange": "NASDAQ", "cap_tier": "mega", "indices": ["sp500"]},
+    ]
+    fake_yf_stocks = [
+        {"ticker": "SMLL", "name": "Small Co", "sector": "Technology",
+         "exchange": "NASDAQ", "cap_tier": "small", "indices": [],
+         "market_cap": 500e6, "price": 25.0, "pe_ratio": 15.0,
+         "avg_daily_volume": 600_000},
+        {"ticker": "TINY", "name": "Tiny Corp", "sector": "Healthcare",
+         "exchange": "NYSE", "cap_tier": "small", "indices": [],
+         "market_cap": 800e6, "price": 10.0, "pe_ratio": 20.0,
+         "avg_daily_volume": 400_000},
+    ]
+
+    def mock_batch_volume(tickers):
+        return {t: 600_000 for t in tickers}
+
+    with patch("app.tools.screener.get_dynamic_universe", new_callable=AsyncMock, return_value=small_universe):
+        with patch("app.tools.screener.get_universe_source_sync", return_value="hardcoded"):
+            with patch("app.tools.screener._yf_screen_by_market_cap", new_callable=AsyncMock, return_value=fake_yf_stocks):
+                with patch("app.tools.screener._batch_download_volume", side_effect=mock_batch_volume):
+                    result = await screen_stocks(
+                        market_cap_range="all",
+                        market_cap_min_override=0,
+                        market_cap_max_override=1e9,
+                        max_results=10,
+                    )
+
+    tickers = [c["ticker"] for c in result["candidates"]]
+    assert "SMLL" in tickers or "TINY" in tickers
+    # AAPL (mega cap) should be filtered out by the market cap override
+    assert "AAPL" not in tickers
+
+
+@pytest.mark.asyncio
+async def test_screen_stocks_yf_screener_empty_returns_zero():
+    """When yfinance screener returns nothing and no matching stocks, result has 0 candidates."""
+    clear_all_caches()
+    with patch("app.tools.screener._yf_screen_by_market_cap", new_callable=AsyncMock, return_value=[]):
+        with patch("app.tools.screener._fetch_ticker_info", return_value=None):
+            result = await screen_stocks(
+                market_cap_range="all",
+                market_cap_min_override=0,
+                market_cap_max_override=100e6,  # extremely small cap — no stocks in universe
+                max_results=10,
+                data_source="hardcoded",
+            )
+
+    assert result["candidates_returned"] == 0
+
+
+@pytest.mark.asyncio
+async def test_yf_screener_skips_info_for_enriched_stocks():
+    """Stocks from yfinance screener with pre-attached market_cap skip individual info fetch."""
+    clear_all_caches()
+    small_universe: list[dict] = []
+    fake_yf_stocks = [
+        {"ticker": "SMLL", "name": "Small Co", "sector": "Tech",
+         "exchange": "NASDAQ", "cap_tier": "small", "indices": [],
+         "market_cap": 500e6, "price": 25.0, "pe_ratio": 15.0,
+         "avg_daily_volume": 600_000},
+    ]
+
+    def mock_batch_volume(tickers):
+        return {t: 600_000 for t in tickers}
+
+    mock_info = AsyncMock(return_value=None)
+
+    with patch("app.tools.screener.get_dynamic_universe", new_callable=AsyncMock, return_value=small_universe):
+        with patch("app.tools.screener.get_universe_source_sync", return_value="hardcoded"):
+            with patch("app.tools.screener._yf_screen_by_market_cap", new_callable=AsyncMock, return_value=fake_yf_stocks):
+                with patch("app.tools.screener._batch_download_volume", side_effect=mock_batch_volume):
+                    with patch("app.tools.screener._fetch_ticker_info") as mock_fetch:
+                        mock_fetch.return_value = None
+                        result = await screen_stocks(
+                            market_cap_range="all",
+                            market_cap_min_override=0,
+                            market_cap_max_override=1e9,
+                            max_results=10,
+                        )
+
+    # _fetch_ticker_info should NOT have been called for SMLL
+    # (it already has market_cap from the yfinance screener)
+    for call in mock_fetch.call_args_list:
+        assert call[0][0] != "SMLL", "Should skip info fetch for pre-enriched stocks"
+
+    tickers = [c["ticker"] for c in result["candidates"]]
+    assert "SMLL" in tickers
+
+
+@pytest.mark.asyncio
 async def test_screen_stocks_exchange_filter():
     result = await screen_stocks(exchanges=["NASDAQ"], max_results=10)
     assert result["candidates_returned"] > 0

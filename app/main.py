@@ -75,6 +75,8 @@ async def suggest(req: SuggestRequest):
         excluded_tickers=req.excluded_tickers,
         dividend_investing=req.dividend_investing,
         data_source=req.data_source.value,
+        market_cap_min_billions=req.market_cap_min_billions,
+        market_cap_max_billions=req.market_cap_max_billions,
     )
 
     # Persist recommendations asynchronously (best-effort)
@@ -176,6 +178,8 @@ async def ws_suggest(ws: WebSocket):
             excluded_tickers=req.excluded_tickers,
             dividend_investing=req.dividend_investing,
             data_source=req.data_source.value,
+            market_cap_min_billions=req.market_cap_min_billions,
+            market_cap_max_billions=req.market_cap_max_billions,
         )
 
         await ws.send_json({"type": "status", "message": "Analysis complete."})

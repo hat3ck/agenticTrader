@@ -152,7 +152,7 @@ async def tool_screen_stocks(
     if market_cap_range == "auto":
         market_cap_range = _RISK_TO_CAP.get(effective_risk, "mid_and_above")
 
-    return await screen_stocks(
+    result = await screen_stocks(
         risk_tolerance=effective_risk,
         sector_preferences=sector_preferences or deps.sector_preferences or None,
         excluded_tickers=excluded_tickers or deps.excluded_tickers or None,
@@ -163,7 +163,16 @@ async def tool_screen_stocks(
         indices=indices,
         max_results=max_results,
         data_source=deps.data_source,
+        market_cap_min_override=deps.market_cap_min,
+        market_cap_max_override=deps.market_cap_max,
     )
+
+    # Track which tickers the screener returned so post-processing can
+    # detect hallucinated symbols the LLM might invent.
+    for candidate in result.get("candidates", []):
+        deps.screened_tickers.add(candidate["ticker"])
+
+    return result
 
 
 @trader_agent.tool
@@ -299,6 +308,82 @@ async def _backfill_analysis_metrics(
     return response
 
 
+async def _enforce_market_cap_bounds(
+    response: TradeRecommendationResponse,
+    market_cap_min: float | None,
+    market_cap_max: float | None,
+) -> TradeRecommendationResponse:
+    """Remove recommendations whose real market cap falls outside the user's bounds.
+
+    Fetches live market cap for each ticker via get_stock_price and drops
+    any that violate the constraints.  Redistributes freed capital
+    proportionally among the remaining recommendations.
+    """
+    if not response.recommendations:
+        return response
+
+    # Fetch live market cap for each recommendation in parallel
+    tasks = [
+        _safe_fetch(get_stock_price, rec.ticker)
+        for rec in response.recommendations
+    ]
+    price_data_list = await asyncio.gather(*tasks)
+
+    kept: list[StockRecommendation] = []
+    removed_tickers: list[str] = []
+    for rec, price_data in zip(response.recommendations, price_data_list):
+        mc = price_data.get("market_cap")
+        if mc is None:
+            # Cannot verify — drop to be safe when user set explicit bounds
+            removed_tickers.append(rec.ticker)
+            continue
+        if market_cap_min is not None and mc < market_cap_min:
+            removed_tickers.append(rec.ticker)
+            continue
+        if market_cap_max is not None and mc > market_cap_max:
+            removed_tickers.append(rec.ticker)
+            continue
+        kept.append(rec)
+
+    if removed_tickers:
+        logger.info(
+            "Market cap filter removed %d recommendation(s): %s",
+            len(removed_tickers),
+            ", ".join(removed_tickers),
+        )
+
+    if not kept:
+        # All recommendations removed — return empty with full cash reserve
+        response.recommendations = []
+        response.cash_reserve_usd = response.cash_reserve_usd + sum(
+            r.allocation_usd for r in response.recommendations
+        )
+        response.cash_reserve_pct = 100.0
+        response.risk_warnings.append(
+            "No stocks matched the requested market cap range. "
+            "All funds are held as cash."
+        )
+        return response
+
+    # Redistribute allocations proportionally among kept recommendations
+    if len(kept) < len(response.recommendations):
+        total_available = sum(r.allocation_usd for r in kept) + sum(
+            r.allocation_usd
+            for r, _ in zip(response.recommendations, price_data_list)
+            if r not in kept
+        )
+        total_funds = total_available + response.cash_reserve_usd
+        weight_sum = sum(r.confidence for r in kept)
+        for rec in kept:
+            rec.allocation_usd = round(
+                total_available * (rec.confidence / weight_sum), 2
+            )
+            rec.allocation_pct = round(rec.allocation_usd / total_funds * 100, 2)
+
+    response.recommendations = kept
+    return response
+
+
 async def run_suggest(
     funds: float,
     horizon: InvestmentHorizon,
@@ -307,6 +392,8 @@ async def run_suggest(
     excluded_tickers: list[str] | None = None,
     dividend_investing: bool = True,
     data_source: str = "auto",
+    market_cap_min_billions: float | None = None,
+    market_cap_max_billions: float | None = None,
 ) -> TradeRecommendationResponse:
     """Run the full suggestion pipeline through the PydanticAI agent."""
     # Compute dynamic recommendation count
@@ -327,6 +414,8 @@ async def run_suggest(
         dividend_investing=dividend_investing,
         min_recommendations=min_recs,
         max_recommendations=max_recs,
+        market_cap_min=market_cap_min_billions * 1e9 if market_cap_min_billions is not None else None,
+        market_cap_max=market_cap_max_billions * 1e9 if market_cap_max_billions is not None else None,
     )
 
     # Build system prompt with strategy context and dynamic sizing
@@ -356,6 +445,17 @@ async def run_suggest(
             "primarily because of their dividend yield. Prefer high-growth "
             "companies over dividend payers. "
         )
+    if market_cap_min_billions is not None or market_cap_max_billions is not None:
+        cap_parts: list[str] = []
+        if market_cap_min_billions is not None:
+            cap_parts.append(f"at least ${market_cap_min_billions:.1f}B")
+        if market_cap_max_billions is not None:
+            cap_parts.append(f"at most ${market_cap_max_billions:.1f}B")
+        user_prompt += (
+            f"IMPORTANT: Only recommend stocks with a market capitalisation "
+            f"{' and '.join(cap_parts)}. "
+            f"Do NOT recommend any stock outside this market cap range. "
+        )
     user_prompt += (
         f"Please screen for candidates, analyse them, check macro conditions, "
         f"and provide between {min_recs} and {max_recs} specific stock "
@@ -367,8 +467,35 @@ async def run_suggest(
         deps=deps,
         instructions=system_prompt,
     )
+    # Post-process: drop any tickers the LLM hallucinated (not from screener)
+    output = result.output
+    if deps.screened_tickers and output.recommendations:
+        valid = []
+        hallucinated = []
+        for rec in output.recommendations:
+            if rec.ticker.upper() in deps.screened_tickers:
+                valid.append(rec)
+            else:
+                hallucinated.append(rec.ticker)
+        if hallucinated:
+            logger.warning(
+                "Removed %d hallucinated ticker(s) not from screener: %s",
+                len(hallucinated), ", ".join(hallucinated),
+            )
+            output.recommendations = valid
+
     # Post-process: replace LLM-generated key_metrics with real tool data
-    return await _backfill_suggest_metrics(result.output)
+    output = await _backfill_suggest_metrics(output)
+
+    # Post-process: enforce market cap bounds using real data
+    if market_cap_min_billions is not None or market_cap_max_billions is not None:
+        output = await _enforce_market_cap_bounds(
+            output,
+            market_cap_min=market_cap_min_billions * 1e9 if market_cap_min_billions is not None else None,
+            market_cap_max=market_cap_max_billions * 1e9 if market_cap_max_billions is not None else None,
+        )
+
+    return output
 
 
 async def run_analyze(

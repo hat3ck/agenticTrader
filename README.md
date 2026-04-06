@@ -57,6 +57,32 @@ curl -X POST http://localhost:8000/api/v1/suggest \
   }'
 ```
 
+### Market Cap Filtering
+
+Narrow recommendations to a specific company-size range:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/suggest \
+  -H "Content-Type: application/json" \
+  -d '{
+    "funds": 200000,
+    "horizon": "1_year",
+    "risk_tolerance": "aggressive",
+    "market_cap_min_billions": 1.0,
+    "market_cap_max_billions": 10.0
+  }'
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `market_cap_min_billions` | `float \| null` | Minimum market cap (billions USD). `null` = no floor. |
+| `market_cap_max_billions` | `float \| null` | Maximum market cap (billions USD). `null` = no ceiling. |
+
+When set, these bounds override the risk-tolerance-based defaults
+(e.g. moderate → ≥$2B). The screener supplements its standard universe
+(S&P 500, NASDAQ-100, etc.) with a live Yahoo Finance equity screen to find
+stocks in the requested range — no paid API key required.
+
 ## Example Response
 
 ```json
@@ -95,17 +121,18 @@ app/
 │   ├── deps.py             # Agent dependencies
 │   └── prompts.py          # System prompt templates
 ├── tools/
-│   ├── market_data.py      # Prices, OHLCV (mock → yfinance)
-│   ├── fundamentals.py     # P/E, ROE, FCF, etc. (mock → yfinance)
+│   ├── market_data.py      # Prices, OHLCV via yfinance
+│   ├── fundamentals.py     # P/E, ROE, FCF, etc. via yfinance + SEC EDGAR
 │   ├── technicals.py       # RSI, MACD, Bollinger (pandas-ta)
-│   ├── sentiment.py        # News + macro (mock → News API + FRED)
-│   ├── screener.py         # Stock universe filtering (mock)
+│   ├── sentiment.py        # News + macro (News API + FRED)
+│   ├── screener.py         # Stock universe filtering + yfinance equity screener
 │   └── portfolio.py        # Kelly Criterion + allocation optimizer
 ├── strategies/
 │   ├── models.py           # Strategy definitions (Pydantic models)
 │   └── registry.py         # Strategy selection logic
 └── data/
     ├── cache.py            # TTLCache (→ Redis)
+    ├── constituents.py     # Dynamic universe (FMP → Wikipedia → hardcoded)
     └── storage.py          # SQLite via SQLAlchemy (→ Postgres)
 ```
 
@@ -115,7 +142,10 @@ app/
 - **Kelly Criterion** for mathematically optimal position sizing (defaults to Half-Kelly)
 - **Codified strategies** as Pydantic models, not LLM prompts — deterministic and auditable
 - **The LLM reasons, the tools compute** — all financial math is in deterministic Python code
-- **Mock data** for market data, fundamentals, sentiment, and screener — swap in real APIs later without changing agent logic
+- **Multi-layer data sourcing** — FMP API → Wikipedia scraping → hardcoded fallback for the stock universe
+- **Free Yahoo Finance equity screener** (`yf.screen()` + `EquityQuery`) for arbitrary market-cap ranges — no API key required
+- **Anti-hallucination guardrails** — the agent can only recommend tickers returned by the screener tool; fabricated symbols are caught and removed in post-processing
+- **Market cap enforcement pipeline** — user bounds flow through the system prompt (LLM guidance), screener filters (universe narrowing), and post-processing verification (live market-cap fetch via yfinance)
 
 ## Running Tests
 
@@ -162,8 +192,13 @@ MACRO_CACHE_TTL=86400
 # Sentiment & Macro APIs
 NEWS_API_KEY=your-newsapi-key        # https://newsapi.org (free, 100 req/day)
 FRED_API_KEY=your-fred-api-key       # https://fred.stlouisfed.org/docs/api/api_key.html (free)
-FMP_API_KEY=your-fmp-api-key         # https://financialmodelingprep.com/developer/docs/pricing/ (free tier, 250 calls/day)
+FMP_API_KEY=your-fmp-api-key         # https://financialmodelingprep.com/developer/docs/pricing/ (optional, free tier)
 ```
+
+> **Note:** The FMP API key is optional. When unavailable (or on the free tier
+> where constituent endpoints return 403), the system automatically falls back
+> to Wikipedia scraping and a hardcoded universe. Market cap screening uses
+> Yahoo Finance's free equity screener API and does not require any API key.
 
 ## License
 

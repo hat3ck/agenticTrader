@@ -38,6 +38,8 @@ class SuggestRequest(BaseModel):
     sector_preferences: list[str] | None = Field(default=None, description="Optional sector preferences")
     excluded_tickers: list[str] | None = Field(default=None, description="Tickers to exclude")
     dividend_investing: bool = Field(default=True, description="Include dividend-focused stocks in recommendations. Set to false to prefer growth stocks over dividend payers.")
+    market_cap_min_billions: float | None = Field(default=None, ge=0, description="Minimum market cap in billions USD (inclusive). Filters out companies below this size.")
+    market_cap_max_billions: float | None = Field(default=None, ge=0, description="Maximum market cap in billions USD (inclusive). Filters out companies above this size.")
     data_source: DataSource = Field(default=DataSource.AUTO, description="Data source for the stock universe (auto, fmp, wikipedia, hardcoded)")
 
 

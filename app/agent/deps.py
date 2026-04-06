@@ -29,6 +29,13 @@ class TraderDeps:
     # Dividend investing preference
     dividend_investing: bool = True
 
+    # User-specified market cap bounds (in USD, converted from billions)
+    market_cap_min: float | None = None
+    market_cap_max: float | None = None
+
     # Dynamic recommendation range
     min_recommendations: int = 3
     max_recommendations: int = 6
+
+    # Tickers returned by the screener tool (populated during agent run)
+    screened_tickers: set[str] = field(default_factory=set)

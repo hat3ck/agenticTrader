@@ -221,6 +221,71 @@ async def _fetch_fmp_smallmid_screener() -> list[StockEntry] | None:
         return None
 
 
+async def fetch_fmp_custom_cap_screener(
+    cap_min: float,
+    cap_max: float,
+    volume_min: int = 100_000,
+    limit: int = 500,
+) -> list[StockEntry] | None:
+    """Fetch US stocks from FMP matching an arbitrary market-cap range.
+
+    Used when the user specifies explicit market_cap_min/max_billions that
+    fall outside the coverage of the standard index-based universe (e.g.
+    micro-cap stocks under $1 B).
+
+    Returns ``None`` if the FMP key is missing or the call fails.
+    """
+    api_key = settings.fmp_api_key
+    if not api_key:
+        return None
+
+    url = (
+        f"{_FMP_BASE}/stock-screener"
+        f"?marketCapMoreThan={int(cap_min)}"
+        f"&marketCapLowerThan={int(cap_max)}"
+        f"&volumeMoreThan={volume_min}"
+        f"&exchange=NYSE,NASDAQ"
+        f"&isActivelyTrading=true"
+        f"&limit={limit}"
+        f"&apikey={api_key}"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            data = resp.json()
+            if not isinstance(data, list):
+                return None
+
+        result: list[StockEntry] = []
+        for raw in data:
+            ticker = raw.get("symbol")
+            if not ticker or "." in ticker:
+                continue
+            name = raw.get("companyName", "")
+            sector = raw.get("sector") or "Unknown"
+            exchange = _EXCHANGE_MAP.get(raw.get("exchangeShortName", ""), "NYSE")
+            market_cap = raw.get("marketCap")
+            cap_tier = _classify_cap_tier(market_cap)
+            result.append({
+                "ticker": ticker.upper(),
+                "name": name,
+                "sector": sector,
+                "exchange": exchange,
+                "cap_tier": cap_tier,
+                "indices": [],
+            })
+
+        logger.info(
+            "FMP custom screener: loaded %d stocks for cap range $%s–$%s",
+            len(result), f"{cap_min:,.0f}", f"{cap_max:,.0f}",
+        )
+        return result if result else None
+    except Exception:
+        logger.exception("FMP custom cap screener request failed")
+        return None
+
+
 # ── Wikipedia scraping ────────────────────────────────────────────────────────
 
 _WIKI_SP500_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"

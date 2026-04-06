@@ -184,6 +184,96 @@ def _fetch_ticker_info(ticker: str) -> dict | None:
         return None
 
 
+# ── Yahoo Finance screening (custom market-cap range) ────────────────────────
+
+# Map Yahoo exchange codes → our canonical names
+_YF_EXCHANGE_MAP: dict[str, str] = {
+    "NMS": "NASDAQ", "NGM": "NASDAQ", "NCM": "NASDAQ",
+    "NYQ": "NYSE", "ASE": "NYSE", "PCX": "NYSE",
+}
+
+# Major US exchanges on Yahoo (excludes OTC/Pink Sheets)
+_YF_MAJOR_EXCHANGES = ("NMS", "NYQ", "NGM", "NCM", "ASE", "PCX")
+
+
+def _yf_screen_by_market_cap_sync(
+    cap_min: float,
+    cap_max: float,
+    volume_min: int = 100_000,
+    limit: int = 250,
+) -> list[dict]:
+    """Use ``yf.screen()`` + ``EquityQuery`` to find US stocks in a market-cap range.
+
+    This is a **free** alternative to FMP's stock-screener endpoint.
+    It queries the Yahoo Finance screener API via yfinance, which requires
+    no API key.
+
+    Returns a list of dicts compatible with the universe StockEntry format.
+    """
+    try:
+        filters = [
+            yf.EquityQuery("eq", ["region", "us"]),
+            yf.EquityQuery("btwn", ["intradaymarketcap", cap_min, cap_max]),
+            yf.EquityQuery("gt", ["avgdailyvol3m", volume_min]),
+            yf.EquityQuery("is-in", ["exchange", *_YF_MAJOR_EXCHANGES]),
+        ]
+        query = yf.EquityQuery("and", filters)
+        response = yf.screen(
+            query,
+            sortField="intradaymarketcap",
+            sortAsc=False,
+            size=min(limit, 250),
+        )
+        quotes = response.get("quotes", [])
+        if not quotes:
+            return []
+
+        from app.data.constituents import _classify_cap_tier  # noqa: avoid circular at module level
+
+        results: list[dict] = []
+        for q in quotes:
+            symbol = q.get("symbol")
+            if not symbol or "." in symbol:
+                continue
+            exchange_raw = q.get("exchange", "")
+            exchange = _YF_EXCHANGE_MAP.get(exchange_raw, "NYSE")
+            market_cap = q.get("marketCap")
+            results.append({
+                "ticker": symbol.upper(),
+                "name": q.get("shortName") or q.get("longName") or "",
+                "sector": q.get("sector", "Unknown"),
+                "exchange": exchange,
+                "cap_tier": _classify_cap_tier(market_cap),
+                "indices": [],
+                # Pre-attach live data so the enrichment step can use it
+                "market_cap": market_cap,
+                "avg_daily_volume": q.get("averageDailyVolume3Month"),
+                "price": q.get("regularMarketPrice"),
+                "pe_ratio": q.get("trailingPE") or q.get("forwardPE"),
+            })
+
+        logger.info(
+            "yfinance screener: found %d stocks for cap range $%s–$%s",
+            len(results), f"{cap_min:,.0f}", f"{cap_max:,.0f}",
+        )
+        return results
+    except Exception:
+        logger.exception("yfinance screen by market cap failed")
+        return []
+
+
+async def _yf_screen_by_market_cap(
+    cap_min: float,
+    cap_max: float,
+    volume_min: int = 100_000,
+    limit: int = 250,
+) -> list[dict]:
+    """Async wrapper around the synchronous yfinance screener call."""
+    return await asyncio.to_thread(
+        _yf_screen_by_market_cap_sync, cap_min, cap_max, volume_min, limit,
+    )
+
+
 # ── Public API ───────────────────────────────────────────────────────────────
 
 async def screen_stocks(
@@ -197,6 +287,8 @@ async def screen_stocks(
     indices: list[str] | None = None,
     max_results: int = 25,
     data_source: str = "auto",
+    market_cap_min_override: float | None = None,
+    market_cap_max_override: float | None = None,
 ) -> dict:
     """Screen the stock universe and return a filtered list of candidates.
 
@@ -245,6 +337,17 @@ async def screen_stocks(
         )
 
         min_cap, max_cap = _resolve_cap_range(market_cap_range)
+
+        # Apply user-specified market cap overrides (in USD).
+        # These REPLACE the risk-based bounds — the user's explicit
+        # request must take priority, otherwise the risk-based floor
+        # (e.g. 2 B for "mid_and_above") can invert the range when the
+        # user asks for a lower cap (e.g. 0–1 B → min=2B, max=1B → ∅).
+        if market_cap_min_override is not None:
+            min_cap = market_cap_min_override
+        if market_cap_max_override is not None:
+            max_cap = market_cap_max_override
+
         cap_tiers = _cap_tiers_for_range(min_cap, max_cap)
 
         # ── 2. Static pre-filter (instant) ───────────────────────────────
@@ -261,6 +364,35 @@ async def screen_stocks(
             universe, excluded, sector_prefs, exchange_set, index_set, pre_cap_tiers,
         )
 
+        # ── 2b. Targeted screener for custom market-cap ranges ────────────
+        # The standard universe (S&P 500, NASDAQ-100, etc.) mostly covers
+        # stocks above ~$1B.  When the user requests a cap range that falls
+        # partially or entirely below that, supplement the universe with
+        # stocks found via the Yahoo Finance screener API (free, no key).
+        if market_cap_min_override is not None or market_cap_max_override is not None:
+            yf_extra = await _yf_screen_by_market_cap(
+                cap_min=max(min_cap, 1.0),
+                cap_max=max_cap if max_cap < float("inf") else 1e15,
+                volume_min=min_avg_daily_volume,
+            )
+            if yf_extra:
+                existing_tickers = {s["ticker"] for s in prefiltered}
+                new_stocks = []
+                for stock in yf_extra:
+                    if stock["ticker"] not in existing_tickers and stock["ticker"] not in excluded:
+                        new_stocks.append(stock)
+                        existing_tickers.add(stock["ticker"])
+                # Prepend screener stocks — they're confirmed in-range and
+                # must not be truncated by _BATCH_LIMIT in favour of the
+                # standard universe stocks (which are mostly out of range).
+                prefiltered = new_stocks + prefiltered
+                total_screened += len(yf_extra)
+                logger.info(
+                    "Supplemented universe with %d stocks from yfinance screener "
+                    "(cap range $%s–$%s)",
+                    len(yf_extra), f"{min_cap:,.0f}", f"{max_cap:,.0f}",
+                )
+
         if not prefiltered:
             return _empty_result(
                 total_screened, market_cap_range, risk_tolerance,
@@ -268,8 +400,10 @@ async def screen_stocks(
                 excluded_tickers, min_avg_daily_volume, max_pe_ratio,
             )
 
-        # Limit how many tickers we send to yfinance (avoid timeouts)
-        _BATCH_LIMIT = 100
+        # Limit how many tickers we send to yfinance (avoid timeouts).
+        # Pre-enriched stocks (from yfinance screener) skip the expensive
+        # individual .info calls, so they're cheap to keep.
+        _BATCH_LIMIT = 250
         prefiltered = prefiltered[:_BATCH_LIMIT]
         tickers = [s["ticker"] for s in prefiltered]
 
@@ -294,14 +428,19 @@ async def screen_stocks(
             )
 
         # ── 4. Detailed info fetch (P/E, market cap, price) ─────────────
-        # Run individual .info calls in the thread pool concurrently
+        # Run individual .info calls in the thread pool concurrently.
+        # Skip tickers that already have enriched data (e.g. from yfinance
+        # screener in step 2b) — they already carry market_cap, price, etc.
         _INFO_LIMIT = 50
-        info_tickers = [s["ticker"] for s in volume_filtered[:_INFO_LIMIT]]
+        tickers_needing_info = [
+            s["ticker"] for s in volume_filtered[:_INFO_LIMIT]
+            if s.get("market_cap") is None
+        ]
 
         loop = asyncio.get_running_loop()
         info_futures = [
             loop.run_in_executor(_executor, _fetch_ticker_info, t)
-            for t in info_tickers
+            for t in tickers_needing_info
         ]
         info_results = await asyncio.gather(*info_futures, return_exceptions=True)
 
@@ -338,6 +477,12 @@ async def screen_stocks(
                 if mc is not None and (mc < min_cap or mc > max_cap):
                     continue
 
+            # When user specified explicit market cap bounds, enforce them even if yfincance doesn't return a market cap
+            if market_cap_min_override is not None or market_cap_max_override is not None:
+                mc = enriched.get("market_cap")
+                if mc is None or mc < min_cap or mc > max_cap:
+                    continue
+
             # Build clean candidate dict (drop internal fields like indices)
             candidates.append({
                 "ticker": enriched["ticker"],
@@ -365,6 +510,12 @@ async def screen_stocks(
 
         candidates = candidates[:max_results]
 
+        logger.info(
+            "Screener returning %d candidates: %s",
+            len(candidates),
+            ", ".join(c["ticker"] for c in candidates[:15]),
+        )
+
         # ── 7. Build response ────────────────────────────────────────────
         filters_desc = (
             f"risk={risk_tolerance}, cap_range={market_cap_range}, "
@@ -391,7 +542,7 @@ async def screen_stocks(
         f"screen:{risk_tolerance}:{market_cap_range}:{min_avg_daily_volume}:"
         f"{max_pe_ratio}:{sorted(sector_preferences or [])}:"
         f"{sorted(excluded_tickers or [])}:{sorted(exchanges or [])}:"
-        f"{sorted(indices or [])}"
+        f"{sorted(indices or [])}:{market_cap_min_override}:{market_cap_max_override}"
     )
     return await async_get_or_set(screener_cache, cache_key, _fetch)
 
