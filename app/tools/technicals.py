@@ -14,6 +14,7 @@ import pandas_ta as ta  # type: ignore
 import yfinance as yf
 
 from app.data.cache import market_data_cache, async_get_or_set
+from app.tools.market_data import _YF_SEMAPHORE
 
 logger = logging.getLogger(__name__)
 
@@ -24,8 +25,9 @@ async def _fetch_real_ohlcv(ticker: str, period: str = "1y") -> pd.DataFrame:
     Returns a DataFrame with columns: Open, High, Low, Close, Volume.
     Falls back to a shorter period if data is insufficient.
     """
-    t = yf.Ticker(ticker.upper())
-    df = await asyncio.to_thread(lambda: t.history(period=period, auto_adjust=True))
+    async with _YF_SEMAPHORE:
+        t = yf.Ticker(ticker.upper())
+        df = await asyncio.to_thread(lambda: t.history(period=period, auto_adjust=True))
     if df.empty:
         raise ValueError(f"No OHLCV data returned by yfinance for {ticker}")
     # Ensure standard column names

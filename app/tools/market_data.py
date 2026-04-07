@@ -20,6 +20,10 @@ from app.data.cache import market_data_cache, async_get_or_set
 
 logger = logging.getLogger(__name__)
 
+# Semaphore to limit concurrent yfinance calls — prevents crumb invalidation
+# from too many simultaneous requests sharing the same session/cookie.
+_YF_SEMAPHORE = asyncio.Semaphore(3)
+
 _VALID_PERIODS = {"1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "ytd", "max"}
 
 
@@ -40,6 +44,48 @@ def _safe(val: Any, fallback: Any = None) -> Any:
 
 def _yf_ticker(ticker: str) -> yf.Ticker:
     return yf.Ticker(ticker.upper())
+
+
+def _reset_yf_crumb() -> None:
+    """Clear the cached crumb/cookie so yfinance re-authenticates on the next call."""
+    try:
+        from yfinance.data import YfData
+        yd = YfData()
+        yd._crumb = None
+        yd._cookie = None
+        logger.debug("Cleared yfinance crumb/cookie cache")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def _yf_info_with_retry(ticker: str, max_retries: int = 2) -> dict:
+    """Fetch ``yf.Ticker(ticker).info`` with retry on crumb/auth failures.
+
+    yfinance shares a global crumb/cookie that can be invalidated by
+    concurrent requests.  On 401 / auth errors we reset the crumb and retry.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            async with _YF_SEMAPHORE:
+                t = _yf_ticker(ticker)
+                info = await asyncio.to_thread(lambda: t.info)
+            if info is None:
+                info = {}
+            return info
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            err_str = str(exc).lower()
+            if "unauthorized" in err_str or "invalid crumb" in err_str or "401" in err_str:
+                logger.debug(
+                    "yfinance auth error for %s (attempt %d/%d): %s — resetting crumb",
+                    ticker, attempt + 1, max_retries + 1, exc,
+                )
+                await asyncio.to_thread(_reset_yf_crumb)
+                await asyncio.sleep(0.5 * (attempt + 1))
+                continue
+            raise
+    raise last_exc
 
 
 # ── Alpha Vantage fallback helpers ───────────────────────────────────────────
@@ -73,7 +119,7 @@ async def _av_quote(ticker: str) -> dict | None:
                 "fifty_two_week_low": None,
                 "currency": "USD",
             }
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("Alpha Vantage quote failed for %s: %s", ticker, exc)
         return None
 
@@ -113,7 +159,7 @@ async def _av_history(ticker: str, period: str) -> dict | None:
                 "data_points": len(bars),
                 "sample_data": bars,
             }
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("Alpha Vantage history failed for %s: %s", ticker, exc)
         return None
 
@@ -129,8 +175,9 @@ async def get_stock_price(ticker: str) -> dict:
 
     async def _fetch() -> dict:
         try:
-            t = _yf_ticker(ticker)
-            info: dict = await asyncio.to_thread(lambda: t.fast_info)
+            async with _YF_SEMAPHORE:
+                t = _yf_ticker(ticker)
+                info: dict = await asyncio.to_thread(lambda: t.fast_info)
             # fast_info is a dict-like object; fall back to .info for extras
             price = _safe(getattr(info, "last_price", None))
             prev_close = _safe(getattr(info, "previous_close", None))
@@ -174,8 +221,9 @@ async def get_historical_data(ticker: str, period: str = "6mo") -> dict:
 
     async def _fetch() -> dict:
         try:
-            t = _yf_ticker(ticker)
-            df = await asyncio.to_thread(lambda: t.history(period=period, auto_adjust=True))
+            async with _YF_SEMAPHORE:
+                t = _yf_ticker(ticker)
+                df = await asyncio.to_thread(lambda: t.history(period=period, auto_adjust=True))
             if df.empty:
                 raise ValueError(f"No historical data returned for {ticker}")
 
@@ -215,8 +263,7 @@ async def get_company_info(ticker: str) -> dict:
 
     async def _fetch() -> dict:
         try:
-            t = _yf_ticker(ticker)
-            info: dict = await asyncio.to_thread(lambda: t.info)
+            info = await _yf_info_with_retry(ticker)
             return {
                 "ticker": ticker.upper(),
                 "name": _safe(info.get("longName") or info.get("shortName"), f"{ticker.upper()} Corp."),
@@ -228,6 +275,15 @@ async def get_company_info(ticker: str) -> dict:
             }
         except Exception as exc:  # noqa: BLE001
             logger.warning("yfinance company info failed for %s: %s", ticker, exc)
-            raise RuntimeError(f"Could not fetch company info for {ticker}: {exc}") from exc
+            # Return default data instead of crashing — allows the pipeline to continue
+            return {
+                "ticker": ticker.upper(),
+                "name": f"{ticker.upper()} Corp.",
+                "sector": "Unknown",
+                "industry": "Unknown",
+                "description": "",
+                "employees": None,
+                "website": "",
+            }
 
     return await async_get_or_set(market_data_cache, f"info:{ticker.upper()}", _fetch)

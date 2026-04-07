@@ -19,6 +19,7 @@ import yfinance as yf
 
 from app.config import settings
 from app.data.cache import fundamental_cache, async_get_or_set
+from app.tools.market_data import _YF_SEMAPHORE
 
 logger = logging.getLogger(__name__)
 
@@ -350,8 +351,9 @@ async def get_fundamental_metrics(ticker: str) -> dict:
 
     async def _fetch():
         try:
-            t = _yf_ticker(ticker)
-            yf_data = await asyncio.to_thread(_extract_yf_fundamentals, t)
+            async with _YF_SEMAPHORE:
+                t = _yf_ticker(ticker)
+                yf_data = await asyncio.to_thread(_extract_yf_fundamentals, t)
         except Exception as exc:  # noqa: BLE001
             logger.warning("yfinance fundamentals failed for %s: %s — trying SEC EDGAR only", ticker, exc)
             yf_data = {
