@@ -24,6 +24,7 @@ from app.models.responses import (
     StockRecommendation,
     TradeRecommendationResponse,
 )
+from app.strategies.models import TradingStrategy
 from app.strategies.registry import (
     compute_recommendation_range,
     get_cash_reserve_pct,
@@ -33,6 +34,7 @@ from app.strategies.registry import (
 from app.tools.fundamentals import get_fundamental_metrics
 from app.tools.market_data import get_company_info, get_historical_data, get_stock_price
 from app.tools.portfolio import optimize_portfolio
+from app.tools.scoring import compute_confidence
 from app.tools.screener import screen_stocks
 from app.tools.sentiment import get_macro_environment, get_news_sentiment
 from app.tools.technicals import get_technical_indicators
@@ -227,21 +229,52 @@ async def tool_get_strategy_context(ctx: RunContext[TraderDeps]) -> dict:
         ],
     }
 
-async def _fetch_real_key_metrics(ticker: str) -> KeyMetrics:
-    """Fetch real key metrics for a ticker from deterministic tools.
 
-    This is called AFTER the LLM response to overwrite any hallucinated
-    metric values with actual data from yfinance / SEC EDGAR.
+@trader_agent.tool
+@analysis_agent.tool
+async def tool_compute_confidence(ctx: RunContext[TraderDeps], ticker: str) -> dict:
+    """Compute a deterministic confidence score for a stock.
+
+    Fetches real fundamentals, technicals, and sentiment data, then evaluates
+    the stock against all active strategy thresholds. Returns a reproducible
+    0–1 score weighted by each strategy's fundamental/technical/sentiment
+    weights, plus a per-strategy breakdown showing which thresholds passed.
+
+    Use this instead of estimating confidence subjectively.
     """
-    fundamentals: dict = {}
-    technicals: dict = {}
+    deps = ctx.deps
+    strategies = select_strategies(deps.horizon, deps.risk_tolerance)
 
-    # Fetch fundamentals and technicals in parallel
     fund_task = asyncio.create_task(_safe_fetch(get_fundamental_metrics, ticker))
     tech_task = asyncio.create_task(_safe_fetch(get_technical_indicators, ticker))
-    fundamentals, technicals = await asyncio.gather(fund_task, tech_task)
+    sent_task = asyncio.create_task(_safe_fetch(get_news_sentiment, ticker))
+    fundamentals, technicals, sentiment = await asyncio.gather(
+        fund_task, tech_task, sent_task,
+    )
 
-    return KeyMetrics(
+    sentiment_score = sentiment.get("sentiment_score", 0.0)
+    result = compute_confidence(strategies, fundamentals, technicals, sentiment_score)
+    result["ticker"] = ticker.upper()
+    result["strategies_evaluated"] = [s.name for s in strategies]
+    return result
+
+
+async def _fetch_metrics_and_score(
+    ticker: str,
+    strategies: list[TradingStrategy],
+) -> tuple[KeyMetrics, float]:
+    """Fetch real metrics and compute deterministic confidence for a ticker.
+
+    Returns (KeyMetrics, confidence_float).
+    """
+    fund_task = asyncio.create_task(_safe_fetch(get_fundamental_metrics, ticker))
+    tech_task = asyncio.create_task(_safe_fetch(get_technical_indicators, ticker))
+    sent_task = asyncio.create_task(_safe_fetch(get_news_sentiment, ticker))
+    fundamentals, technicals, sentiment = await asyncio.gather(
+        fund_task, tech_task, sent_task,
+    )
+
+    key_metrics = KeyMetrics(
         pe_ratio=fundamentals.get("pe_ratio"),
         trailing_pe=fundamentals.get("trailing_pe"),
         forward_pe=fundamentals.get("forward_pe"),
@@ -259,6 +292,11 @@ async def _fetch_real_key_metrics(ticker: str) -> KeyMetrics:
         sma_trend=technicals.get("sma_trend"),
     )
 
+    sentiment_score = sentiment.get("sentiment_score", 0.0)
+    result = compute_confidence(strategies, fundamentals, technicals, sentiment_score)
+
+    return key_metrics, result["confidence"]
+
 
 async def _safe_fetch(fn, ticker: str) -> dict:
     """Call an async tool function, returning {} on failure."""
@@ -271,30 +309,36 @@ async def _safe_fetch(fn, ticker: str) -> dict:
 
 async def _backfill_suggest_metrics(
     response: TradeRecommendationResponse,
+    strategies: list[TradingStrategy],
 ) -> TradeRecommendationResponse:
-    """Replace LLM-generated key_metrics with real tool data for every recommendation."""
+    """Replace LLM-generated key_metrics and confidence with real data."""
     if not response.recommendations:
         return response
 
-    # Fetch real metrics for all tickers in parallel
+    # Fetch real metrics + deterministic confidence for all tickers in parallel
     tasks = [
-        _fetch_real_key_metrics(rec.ticker)
+        _fetch_metrics_and_score(rec.ticker, strategies)
         for rec in response.recommendations
     ]
-    real_metrics_list = await asyncio.gather(*tasks)
+    results = await asyncio.gather(*tasks)
 
-    # Overwrite each recommendation's key_metrics
-    for rec, real_metrics in zip(response.recommendations, real_metrics_list):
+    for rec, (real_metrics, confidence) in zip(response.recommendations, results):
         rec.key_metrics = real_metrics
+        rec.confidence = confidence
 
     return response
 
 
 async def _backfill_analysis_metrics(
     response: AnalysisResponse,
+    strategies: list[TradingStrategy],
 ) -> AnalysisResponse:
-    """Replace LLM-generated key_metrics with real tool data for an analysis."""
-    response.key_metrics = await _fetch_real_key_metrics(response.ticker)
+    """Replace LLM-generated key_metrics and confidence with real data."""
+    key_metrics, confidence = await _fetch_metrics_and_score(
+        response.ticker, strategies,
+    )
+    response.key_metrics = key_metrics
+    response.confidence = confidence
 
     # Overwrite company_name with real data to prevent hallucination
     try:
@@ -484,8 +528,8 @@ async def run_suggest(
             )
             output.recommendations = valid
 
-    # Post-process: replace LLM-generated key_metrics with real tool data
-    output = await _backfill_suggest_metrics(output)
+    # Post-process: replace LLM-generated key_metrics and confidence with real data
+    output = await _backfill_suggest_metrics(output, strategies)
 
     # Post-process: enforce market cap bounds using real data
     if market_cap_min_billions is not None or market_cap_max_billions is not None:
@@ -503,11 +547,12 @@ async def run_analyze(
     horizon: InvestmentHorizon = InvestmentHorizon.THREE_MONTHS,
 ) -> AnalysisResponse:
     """Run a deep-dive analysis on a single ticker."""
+    strategies = select_strategies(horizon)
     deps = TraderDeps(
         funds=0,
         horizon=horizon,
         risk_tolerance=RiskTolerance.MODERATE,
-        selected_strategies=[s.name for s in select_strategies(horizon)],
+        selected_strategies=[s.name for s in strategies],
         kelly_mode=get_kelly_mode(horizon),
         cash_reserve_pct=get_cash_reserve_pct(horizon),
     )
@@ -535,5 +580,5 @@ async def run_analyze(
     )
 
     result = await analysis_agent.run(user_prompt, deps=deps)
-    # Post-process: replace LLM-generated key_metrics with real tool data
-    return await _backfill_analysis_metrics(result.output)
+    # Post-process: replace LLM-generated key_metrics and confidence with real data
+    return await _backfill_analysis_metrics(result.output, strategies)
