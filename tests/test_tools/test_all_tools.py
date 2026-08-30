@@ -1,7 +1,10 @@
 """Unit tests for market data, fundamentals, technicals, sentiment, screener tools."""
 
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pandas as pd
 import pytest
-from unittest.mock import AsyncMock, patch
+
 from app.tools.market_data import get_stock_price, get_historical_data, get_company_info
 from app.tools.fundamentals import get_fundamental_metrics
 from app.tools.technicals import get_technical_indicators
@@ -81,6 +84,34 @@ async def test_get_technicals():
     assert result["rsi_signal"] in ("overbought", "oversold", "neutral")
     assert result["macd_signal"] in ("bullish", "bearish", "neutral")
     assert result["sma_trend"] in ("golden_cross", "death_cross", "neutral")
+
+
+@pytest.mark.asyncio
+async def test_get_technicals_retries_yfinance_auth_failures():
+    mock_ticker = MagicMock()
+    sample_df = pd.DataFrame(
+        {
+            "Open": [100.0, 101.0, 102.0],
+            "High": [101.0, 102.0, 103.0],
+            "Low": [99.0, 100.0, 101.0],
+            "Close": [100.5, 101.5, 102.5],
+            "Volume": [1_000_000, 1_100_000, 1_200_000],
+        }
+    )
+    mock_ticker.history.side_effect = [Exception("401 Unauthorized"), sample_df]
+
+    with patch("app.tools.technicals.yf.Ticker", return_value=mock_ticker):
+        with patch("app.tools.technicals._reset_yf_crumb") as reset_mock:
+            with patch(
+                "app.tools.technicals._compute_indicators",
+                return_value={"rsi": 50.0, "rsi_signal": "neutral"},
+            ):
+                result = await get_technical_indicators("AAPL")
+
+    assert result["ticker"] == "AAPL"
+    assert result["rsi"] == 50.0
+    assert mock_ticker.history.call_count == 2
+    reset_mock.assert_called_once()
 
 
 # ── Sentiment ────────────────────────────────────────────

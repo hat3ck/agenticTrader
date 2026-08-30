@@ -14,7 +14,7 @@ import pandas_ta as ta  # type: ignore
 import yfinance as yf
 
 from app.data.cache import market_data_cache, async_get_or_set
-from app.tools.market_data import _YF_SEMAPHORE
+from app.tools.market_data import _YF_SEMAPHORE, _reset_yf_crumb
 
 logger = logging.getLogger(__name__)
 
@@ -25,18 +25,48 @@ async def _fetch_real_ohlcv(ticker: str, period: str = "1y") -> pd.DataFrame:
     Returns a DataFrame with columns: Open, High, Low, Close, Volume.
     Falls back to a shorter period if data is insufficient.
     """
-    async with _YF_SEMAPHORE:
-        t = yf.Ticker(ticker.upper())
-        df = await asyncio.to_thread(lambda: t.history(period=period, auto_adjust=True))
-    if df.empty:
-        raise ValueError(f"No OHLCV data returned by yfinance for {ticker}")
-    # Ensure standard column names
-    df = df.rename(columns={c: c.title() for c in df.columns})
-    # Keep only the columns we need
-    for col in ("Open", "High", "Low", "Close", "Volume"):
-        if col not in df.columns:
-            raise ValueError(f"Missing '{col}' column in yfinance data for {ticker}")
-    return df[["Open", "High", "Low", "Close", "Volume"]]
+    periods_to_try = [period, "6mo", "3mo"]
+    last_exc: Exception | None = None
+
+    for current_period in dict.fromkeys(periods_to_try):
+        for attempt in range(3):
+            try:
+                async with _YF_SEMAPHORE:
+                    t = yf.Ticker(ticker.upper())
+                    df = await asyncio.to_thread(
+                        lambda: t.history(period=current_period, auto_adjust=True)
+                    )
+                if df.empty:
+                    last_exc = ValueError(
+                        f"No OHLCV data returned by yfinance for {ticker} ({current_period})"
+                    )
+                    break
+                # Ensure standard column names
+                df = df.rename(columns={c: c.title() for c in df.columns})
+                # Keep only the columns we need
+                for col in ("Open", "High", "Low", "Close", "Volume"):
+                    if col not in df.columns:
+                        raise ValueError(f"Missing '{col}' column in yfinance data for {ticker}")
+                return df[["Open", "High", "Low", "Close", "Volume"]]
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                err_str = str(exc).lower()
+                if "unauthorized" in err_str or "invalid crumb" in err_str or "401" in err_str:
+                    logger.debug(
+                        "yfinance auth error for %s period=%s attempt=%d/3: %s",
+                        ticker,
+                        current_period,
+                        attempt + 1,
+                        exc,
+                    )
+                    await asyncio.to_thread(_reset_yf_crumb)
+                    await asyncio.sleep(0.5 * (attempt + 1))
+                    continue
+                raise
+
+    if last_exc is not None:
+        raise last_exc
+    raise ValueError(f"No OHLCV data returned by yfinance for {ticker}")
 
 
 def _compute_indicators(df: pd.DataFrame) -> dict:
